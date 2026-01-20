@@ -143,7 +143,12 @@ class FeatureEngineer:
         print("Calculating Head-to-Head (H2H)...")
         # Rolling avg against specific opponent
         # Group by Player, Opponent
-        cols = ['PTS', 'REB', 'AST']
+        cols = ['PTS', 'REB', 'AST', 'FGM', 'FGA', 'FG_PCT', 'FG3M', 'FG3A', 'FG3_PCT', 
+                'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'STL', 'BLK', 'TOV', 'PF', 'PLUS_MINUS']
+        # Ensure cols exist
+        for c in cols:
+            if c not in df.columns:
+                df[c] = 0.0
         
         # Sort by date
         df = df.sort_values('GAME_DATE')
@@ -159,7 +164,10 @@ class FeatureEngineer:
                  lambda x: x.shift(1).rolling(5, min_periods=1).mean()
              )
              
-        df[[f'H2H_{col}' for col in cols]] = df[[f'H2H_{col}' for col in cols]].fillna(0) # No history -> 0
+        # Fill NaNs with global mean
+        for col in cols:
+            val = df[col].mean()
+            df[f'H2H_{col}'] = df[f'H2H_{col}'].fillna(val)
         print("H2H Features Added.")
         return df
 
@@ -266,6 +274,80 @@ class FeatureEngineer:
         df['OPP_TEAM_ABBREVIATION'] = df['MATCHUP'].apply(lambda x: x.split(' ')[-1])
         return df
 
+    def calculate_team_stats(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculates Team-Level Advanced Stats (Off Rtg, Def Rtg, Pace)
+        and merges them as 'Opponent Stats' for the player.
+        """
+        print("Calculating Team Advanced Stats...")
+        
+        # 1. Aggregate Player Stats to Team-Game Level
+        # Sum targets: PTS, FGA, FTA, OREB, TOV, MIN
+        # We need DREB? Total REB - OREB = DREB usually.
+        # Poss formula: 0.96 * (FGA + 0.008*FTA - 1.07*(OREB/ (OREB + OppDREB))) ... too complex.
+        # Simple NBA Poss: FGA + 0.44*FTA - OREB + TOV
+        
+        team_game_stats = df.groupby(['GAME_ID', 'TEAM_ID', 'GAME_DATE', 'TEAM_ABBREVIATION'])[['PTS', 'FGA', 'FTA', 'OREB', 'TOV', 'MIN']].sum().reset_index()
+        
+        # 2. Calculate Basic Team Metrics
+        team_game_stats['POSS'] = team_game_stats['FGA'] + 0.44 * team_game_stats['FTA'] - team_game_stats['OREB'] + team_game_stats['TOV']
+        # Normalize Pace to 48 mins: Poss / (MIN / 5) * 48. (5 players on court)
+        # Avoid div by zero
+        team_game_stats['PACE'] = 48 * (team_game_stats['POSS'] / (team_game_stats['MIN'] / 5))
+        team_game_stats['OFF_RTG'] = 100 * (team_game_stats['PTS'] / team_game_stats['POSS'])
+        
+        # 3. Find Opponent to get DEF_RTG (Opponent's Off Rtg)
+        # Self-join on GAME_ID
+        game_opps = team_game_stats.merge(team_game_stats[['GAME_ID', 'TEAM_ID', 'OFF_RTG', 'PACE']], 
+                                          on='GAME_ID', suffixes=('', '_OPP'))
+        
+        # Filter out self-matches (Team A vs Team A) - usually game has 2 rows.
+        game_opps = game_opps[game_opps['TEAM_ID'] != game_opps['TEAM_ID_OPP']]
+        
+        # Now we have: For Team A, DEF_RTG = OPP_OFF_RTG
+        game_opps['DEF_RTG'] = game_opps['OFF_RTG_OPP']
+        
+        # We want to store these stats FOR THE TEAM, so we can look them up as an OPPONENT later.
+        # Identify the Team we are tracking metrics FOR.
+        # We want "How good is Team X?".
+        # So we keep rows for Team X.
+        
+        cols_to_keep = ['GAME_DATE', 'TEAM_ABBREVIATION', 'OFF_RTG', 'DEF_RTG', 'PACE']
+        team_history = game_opps[cols_to_keep].copy()
+        team_history = team_history.sort_values('GAME_DATE')
+        
+        # 4. Calculate Rolling Stats
+        # Group by Team
+        roll_cols = ['OFF_RTG', 'DEF_RTG', 'PACE']
+        for col in roll_cols:
+            # Shift 1 to use PAST games only
+            team_history[f'TEAM_ROLL_{col}'] = team_history.groupby('TEAM_ABBREVIATION')[col].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+            
+        # Fill NaNs with league average
+        for col in roll_cols:
+            mean_val = team_history[col].mean()
+            team_history[f'TEAM_ROLL_{col}'] = team_history[f'TEAM_ROLL_{col}'].fillna(mean_val)
+            
+        # 5. Merge back to Player DF as "OPP_TEAM_ROLL_..."
+        # df has 'OPP_TEAM_ABBREVIATION'.
+        # We join team_history on [TEAM_ABBREV, GAME_DATE] -> [OPP_TEAM_ABBREV, GAME_DATE]
+        
+        # Prepare merge source
+        merge_src = team_history[['GAME_DATE', 'TEAM_ABBREVIATION', 'TEAM_ROLL_OFF_RTG', 'TEAM_ROLL_DEF_RTG', 'TEAM_ROLL_PACE']]
+        merge_src.columns = ['GAME_DATE', 'OPP_TEAM_ABBREVIATION', 'OPP_ROLL_OFF_RTG', 'OPP_ROLL_DEF_RTG', 'OPP_ROLL_PACE']
+        
+        # Merge
+        df = df.merge(merge_src, on=['GAME_DATE', 'OPP_TEAM_ABBREVIATION'], how='left')
+        
+        # Fill missing (e.g. first game of season or no history)
+        # Fill with global means from the merge_src (approx league avg)
+        for col in ['OPP_ROLL_OFF_RTG', 'OPP_ROLL_DEF_RTG', 'OPP_ROLL_PACE']:
+             df[col] = df[col].fillna(merge_src[col].mean())
+             
+        print("Team Advanced Stats Added.")
+        return df
+
+
     def process(self, df: pd.DataFrame, is_training: bool = True, overrides: dict = None) -> pd.DataFrame:
         """
         overrides: Dict of {(PlayerID, Date_Str) : {'Col': Val}} to manually set feature values before scaling.
@@ -290,6 +372,9 @@ class FeatureEngineer:
              
         # Add H2H
         df = self.calculate_h2h(df)
+        
+        # Add Team Stats (Defense/Pace)
+        df = self.calculate_team_stats(df)
         
         # Add Teammate Impact
         df = self.calculate_missing_players(df)
@@ -321,9 +406,11 @@ class FeatureEngineer:
         
         # 1. Rolling Averages (Player Form)
         # Shift by 1 so we don't cheat using today's stats
-        cols = ['PTS', 'REB', 'AST', 'FGA', 'MIN']
+        cols = ['PTS', 'REB', 'AST', 'FGM', 'FGA', 'FG_PCT', 'FG3M', 'FG3A', 'FG3_PCT', 
+                'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'STL', 'BLK', 'TOV', 'PF', 'PLUS_MINUS', 'MIN']
         for col in cols:
-             df[f'ROLL_{col}'] = df.groupby('PLAYER_ID')[col].transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+             if col in df.columns:
+                 df[f'ROLL_{col}'] = df.groupby('PLAYER_ID')[col].transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
              
         # 2. Rest Days
         df['GAME_DATE_DT'] = df['GAME_DATE']
@@ -414,7 +501,8 @@ class FeatureEngineer:
                    'GAME_ID', 'GAME_DATE', 'MATCHUP', 'WL', 'MIN', 'VIDEO_AVAILABLE', 
                    'PLAYER_NAME', 'OPP_TEAM_ABBREVIATION', 'SEASON_YEAR', 
                    'PLAYER_IDX', 'TEAM_IDX', 'GAME_DATE_DT', 'PREV_GAME_DATE',
-                   'POSITION_SIMPLE', 'def_PTS', 'def_REB', 'def_AST'] # Exclude raw daily stats, keep ROLL/H2H
+                   'POSITION_SIMPLE', 'def_PTS', 'def_REB', 'def_AST',
+                   'POSS', 'OFF_RTG', 'DEF_RTG', 'PACE', 'TEAM_ABBREVIATION_OPP'] # Exclude intermediate calc
                    
         # Also exclude Targets
         exclude += ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'PF', 'FGM', 'FGA', 'FG_PCT', 

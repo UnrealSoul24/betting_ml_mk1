@@ -219,11 +219,17 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
     train_indices, val_indices = train_test_split(np.arange(len(df)), test_size=0.15, shuffle=True, random_state=42)
     
     # Calculate Baseline MAE (Mean of Train Predicts Val)
-    y_train_pts = y[train_indices, 0]
-    y_val_pts = y[val_indices, 0]
-    baseline_pred = np.mean(y_train_pts)
-    baseline_mae_pts = np.mean(np.abs(y_val_pts - baseline_pred))
-    print(f"Baseline MAE for PTS (Guessing {baseline_pred:.1f}): {baseline_mae_pts:.4f}")
+    y_train = y[train_indices]
+    y_val = y[val_indices]
+    
+    baseline_preds = np.mean(y_train, axis=0) # [PTS, REB, AST]
+    baseline_mae = np.mean(np.abs(y_val - baseline_preds), axis=0)
+    
+    baseline_mae_pts = baseline_mae[0]
+    baseline_mae_reb = baseline_mae[1]
+    baseline_mae_ast = baseline_mae[2]
+    
+    print(f"Baseline MAE - PTS: {baseline_mae_pts:.4f}, REB: {baseline_mae_reb:.4f}, AST: {baseline_mae_ast:.4f}")
 
     # Weighted Sampler for Training
     # Give higher weight to recent seasons (2025-26)
@@ -291,30 +297,55 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
     }
     
     # Plotting Setup for Debug
-    if debug:
+    # Plotting Setup (Debug or Pretrain)
+    if debug or pretrain:
         import matplotlib.pyplot as plt
         plt.ion() # Interactive mode
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        fig, axs = plt.subplots(2, 2, figsize=(15, 10))
         
         # Plot 1: Loss
-        line_train_loss, = ax1.plot([], [], label='Train Loss')
-        line_val_loss, = ax1.plot([], [], label='Val Loss')
-        ax1.set_title(f'Loss (Player {target_player_id})')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('MSE Loss')
-        ax1.legend()
-        ax1.grid(True)
+        ax_loss = axs[0, 0]
+        line_train_loss, = ax_loss.plot([], [], label='Train Loss')
+        line_val_loss, = ax_loss.plot([], [], label='Val Loss')
+        ax_loss.set_title(f'Loss ({ "Global" if pretrain else f"Player {target_player_id}" })')
+        ax_loss.set_xlabel('Epoch')
+        ax_loss.set_ylabel('MSE Loss')
+        ax_loss.legend()
+        ax_loss.grid(True)
         
-        # Plot 2: MAE
-        line_mae, = ax2.plot([], [], label='PTS MAE')
-        ax2.axhline(y=baseline_mae_pts, color='r', linestyle='--', label='Baseline')
-        ax2.set_title(f'MAE (Player {target_player_id})')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('MAE')
-        ax2.legend()
-        ax2.grid(True)
+        # Plot 2: PTS MAE
+        ax_pts = axs[0, 1]
+        line_mae_pts, = ax_pts.plot([], [], label='PTS MAE')
+        ax_pts.axhline(y=baseline_mae_pts, color='r', linestyle='--', label='Baseline')
+        ax_pts.set_title('PTS MAE')
+        ax_pts.set_xlabel('Epoch')
+        ax_pts.legend()
+        ax_pts.grid(True)
+
+        # Plot 3: REB MAE
+        ax_reb = axs[1, 0]
+        line_mae_reb, = ax_reb.plot([], [], label='REB MAE')
+        ax_reb.axhline(y=baseline_mae_reb, color='r', linestyle='--', label='Baseline')
+        ax_reb.set_title('REB MAE')
+        ax_reb.set_xlabel('Epoch')
+        ax_reb.legend()
+        ax_reb.grid(True)
+
+        # Plot 4: AST MAE
+        ax_ast = axs[1, 1]
+        line_mae_ast, = ax_ast.plot([], [], label='AST MAE')
+        ax_ast.axhline(y=baseline_mae_ast, color='r', linestyle='--', label='Baseline')
+        ax_ast.set_title('AST MAE')
+        ax_ast.set_xlabel('Epoch')
+        ax_ast.legend()
+        ax_ast.grid(True)
         
-        plot_path = os.path.join(DATA_DIR, f'training_curve_{target_player_id}.png')
+        plt.tight_layout()
+        
+        if pretrain:
+            plot_path = os.path.join(DATA_DIR, 'training_curve_global.png')
+        else:
+            plot_path = os.path.join(DATA_DIR, f'training_curve_{target_player_id}.png')
 
     print("\nStarting Training...")
     print(f"{'Epoch':<6} | {'Train Loss':<10} | {'Val Loss':<10} | {'PTS MAE':<10} | {'REB MAE':<10}")
@@ -391,14 +422,17 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
         history['mae_ast'].append(mae_ast)
         
         # Update Plot
-        if debug:
+        if debug or pretrain:
             # Update data
             line_train_loss.set_data(history['epoch'], history['train_loss'])
             line_val_loss.set_data(history['epoch'], history['val_loss'])
-            line_mae.set_data(history['epoch'], history['mae_pts'])
+            
+            line_mae_pts.set_data(history['epoch'], history['mae_pts'])
+            line_mae_reb.set_data(history['epoch'], history['mae_reb'])
+            line_mae_ast.set_data(history['epoch'], history['mae_ast'])
             
             # Rescale axes
-            for ax in [ax1, ax2]:
+            for ax in [ax_loss, ax_pts, ax_reb, ax_ast]:
                 ax.relim()
                 ax.autoscale_view()
             
@@ -406,7 +440,7 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
             plt.draw()
             plt.pause(0.01) # Trigger full redraw loop
             
-            # Save current frame frequently (e.g. every 10 epochs or just every epoch if fast)
+            # Save current frame frequently
             if epoch % 5 == 0:
                  plt.savefig(plot_path)
 
@@ -422,11 +456,11 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
         if (epoch+1) % 10 == 0:
              print(f"{epoch+1:<6} | {train_loss:<10.4f} | {avg_val_loss:<10.4f} | {mae_pts:<10.4f} | {mae_reb:<10.4f}")
     
-    # Save model at end if debug (or best if early stopping)
+    # Save model at end
     if not early_stopping:
         torch.save(model.state_dict(), save_path)
         print(f"\nDebug Run Complete. Model Saved to {save_path}")
-        if debug: 
+        if debug or pretrain: 
             plt.savefig(plot_path)
             print(f"Final plot saved to {plot_path}")
             plt.ioff()
