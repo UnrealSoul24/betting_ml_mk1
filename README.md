@@ -95,3 +95,26 @@ Prediction Results:
 *   **Edge**: ~15% improvement over baseline.
 
 **Note**: Predictions are estimates of *mean performance*. Standard deviation for superstars is +/- 8-10 points. Always bet responsibly.
+
+## 🛠️ Troubleshooting & Maintenance
+
+### 1. "Size Mismatch" Error (Model Loading Failed)
+If you see errors like `RuntimeError: size mismatch for player_emb.weight`, it means your saved models are outdated because the player list (feature engineering) has changed.
+
+**Fix (Manual Update):**
+1.  **Delete old models**:
+    *   Navigate to `data/models/` and delete all `.pth` files (or just the ones failing).
+    *   *PowerShell*: `Remove-Item data\models\*.pth`
+2.  **Retrain Global Model** (Creates a fresh fallback model):
+    ```bash
+    python -m src.train_models --pretrain
+    ```
+
+### 2. Running the API Server
+To start the backend for the UI:
+```bash
+uvicorn src.api:app --reload
+```
+*   The API will run at `http://127.0.0.1:8000`
+*   WebSocket logs available at `ws://127.0.0.1:8000/logs`
+

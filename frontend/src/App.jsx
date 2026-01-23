@@ -13,13 +13,18 @@ import {
 import { clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 
+import ParlayCard from "./components/ParlayCard";
+import BetCard from "./components/BetCard";
+import PlayerDetailModal from "./components/PlayerDetailModal";
+
 function cn(...inputs) {
   return twMerge(clsx(inputs));
 }
 
 export default function App() {
   const [logs, setLogs] = useState([]);
-  const [predictions, setPredictions] = useState([]);
+  const [predictions, setPredictions] = useState({});
+  const [selectedPlayer, setSelectedPlayer] = useState(null);
   const [selectedDate, setSelectedDate] = useState(
     new Date().toISOString().split("T")[0],
   );
@@ -82,10 +87,10 @@ export default function App() {
       });
 
       const data = await response.json();
-      if (data.results) {
-        setPredictions(data.results);
+      if (data.results || data.predictions) {
+        setPredictions(data); // Always use full object for new UI
         addLog(
-          `Analysis Complete. ${data.results.length} predictions received.`,
+          `Analysis Complete. ${data.predictions ? data.predictions.length : (data.results ? data.results.length : 0)} predictions received.`,
         );
       }
     } catch (e) {
@@ -165,7 +170,7 @@ export default function App() {
           </div>
 
           {/* Console Log */}
-          <div className="glass p-4 rounded-2xl h-[500px] flex flex-col font-mono text-xs relative overflow-hidden">
+          <div className="glass p-4 rounded-2xl h-[400px] flex flex-col font-mono text-xs relative overflow-hidden">
             <div className="flex items-center justify-between mb-2 pb-2 border-b border-white/5">
               <span className="flex items-center gap-2 text-gray-400">
                 <Terminal size={14} /> SYSTEM LOG
@@ -198,155 +203,42 @@ export default function App() {
         {/* Right Column: Results */}
         <div className="lg:col-span-2 space-y-6">
           <h2 className="text-xl font-bold flex items-center gap-2">
-            <Trophy className="text-amber-400" /> TOP PICKS
+            <Trophy className="text-amber-400" /> DAILY DASHBOARD
           </h2>
 
-          {predictions.length === 0 ? (
+          {!isLoading && predictions.trixie && (
+            <ParlayCard
+              trixie={predictions.trixie}
+              onLegClick={(leg) => setSelectedPlayer(leg)}
+            />
+          )}
+
+          {(!predictions.predictions || predictions.predictions.length === 0) ? (
             <div className="h-[400px] border-2 border-dashed border-white/10 rounded-3xl flex items-center justify-center text-gray-600">
               NO DATA AVAILABLE
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {/* Top 4 Cards */}
-              {predictions.slice(0, 50).map((pred, i) => (
-                <motion.div
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: i * 0.05 }}
+              {predictions.predictions.slice(0, 50).map((pred, i) => (
+                <BetCard
                   key={i}
-                  className="glass-card p-5 rounded-2xl relative overflow-hidden group hover:border-neon-green/30 transition-colors"
-                >
-                  {/* Header */}
-                  <div className="flex justify-between items-start mb-4">
-                    <div>
-                      <h3 className="text-xl font-bold text-white">
-                        {pred.PLAYER_NAME}
-                      </h3>
-                      <div className="text-xs text-gray-400 flex items-center gap-2 mt-1">
-                        <span
-                          className={cn(
-                            "px-1.5 py-0.5 rounded font-bold text-[10px]",
-                            pred.IS_HOME
-                              ? "bg-white/10 text-white"
-                              : "bg-neon-blue/20 text-neon-blue",
-                          )}
-                        >
-                          {pred.IS_HOME ? "HOME" : "AWAY"}
-                        </span>
-                        <span className="bg-white/5 border border-white/10 px-1.5 py-0.5 rounded text-[10px]">
-                          {pred.MATCHUP}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-xs text-gray-400">Proj. PRA</div>
-                      <div className="text-2xl font-black text-neon-green tracking-tighter">
-                        {pred.PRED_PRA?.toFixed(1) ||
-                          (
-                            pred.PRED_PTS +
-                            pred.PRED_REB +
-                            pred.PRED_AST
-                          ).toFixed(1)}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Main Stats Grid */}
-                  <div className="grid grid-cols-3 gap-2 mt-4 bg-black/40 p-3 rounded-xl border border-white/5">
-                    <div className="text-center">
-                      <div className="text-[10px] text-gray-500 mb-1 uppercase tracking-wider">
-                        Points
-                      </div>
-                      <div className="font-bold text-lg">
-                        {pred.PRED_PTS.toFixed(1)}
-                      </div>
-                      <div className="text-[10px] text-gray-600 mt-1">
-                        Line: {pred.LINE_PTS_LOW?.toFixed(1)} -{" "}
-                        {pred.LINE_PTS_HIGH?.toFixed(1)}
-                      </div>
-                    </div>
-                    <div className="text-center border-l border-white/5">
-                      <div className="text-[10px] text-gray-500 mb-1 uppercase tracking-wider">
-                        Rebs
-                      </div>
-                      <div className="font-bold text-lg">
-                        {pred.PRED_REB.toFixed(1)}
-                      </div>
-                      <div className="text-[10px] text-gray-600 mt-1">
-                        Line: {pred.LINE_REB_LOW?.toFixed(1)} -{" "}
-                        {pred.LINE_REB_HIGH?.toFixed(1)}
-                      </div>
-                    </div>
-                    <div className="text-center border-l border-white/5">
-                      <div className="text-[10px] text-gray-500 mb-1 uppercase tracking-wider">
-                        Asts
-                      </div>
-                      <div className="font-bold text-lg">
-                        {pred.PRED_AST.toFixed(1)}
-                      </div>
-                      <div className="text-[10px] text-gray-600 mt-1">
-                        Line: {pred.LINE_AST_LOW?.toFixed(1)} -{" "}
-                        {pred.LINE_AST_HIGH?.toFixed(1)}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Combos & Detailed Lines */}
-                  <div className="mt-4 pt-4 border-t border-white/5 grid grid-cols-2 gap-4">
-                    <div>
-                      <div className="text-[10px] font-mono text-gray-500 mb-2 uppercase">
-                        Combos
-                      </div>
-                      <div className="space-y-1">
-                        <div className="flex justify-between text-xs">
-                          <span className="text-gray-400">Pts+Reb</span>
-                          <span className="font-bold text-white">
-                            {pred.PRED_PR?.toFixed(1)}
-                          </span>
-                        </div>
-                        <div className="flex justify-between text-xs">
-                          <span className="text-gray-400">Pts+Ast</span>
-                          <span className="font-bold text-white">
-                            {pred.PRED_PA?.toFixed(1)}
-                          </span>
-                        </div>
-                        <div className="flex justify-between text-xs">
-                          <span className="text-gray-400">Reb+Ast</span>
-                          <span className="font-bold text-white">
-                            {pred.PRED_RA?.toFixed(1)}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div>
-                      <div className="text-[10px] font-mono text-gray-500 mb-2 uppercase flex items-center gap-1">
-                        <AlertCircle size={10} /> Safe Zones
-                      </div>
-                      <div className="space-y-1.5 text-[10px] text-gray-400">
-                        <div className="flex justify-between bg-white/5 px-2 py-1 rounded">
-                          <span>Bet Over</span>
-                          <span className="text-neon-green font-mono font-bold">
-                            &lt; {pred.LINE_PRA_LOW?.toFixed(1)}
-                          </span>
-                        </div>
-                        <div className="flex justify-between bg-white/5 px-2 py-1 rounded">
-                          <span>Bet Under</span>
-                          <span className="text-red-400 font-mono font-bold">
-                            &gt; {pred.LINE_PRA_HIGH?.toFixed(1)}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </motion.div>
+                  pred={pred}
+                  index={i}
+                  onClick={() => setSelectedPlayer(pred)}
+                />
               ))}
             </div>
           )}
-
-          {/* Full Table Link or Expander could go here */}
         </div>
       </main>
+
+      {selectedPlayer && (
+        <PlayerDetailModal
+          isOpen={!!selectedPlayer}
+          onClose={() => setSelectedPlayer(null)}
+          player={selectedPlayer}
+        />
+      )}
     </div>
   );
 }

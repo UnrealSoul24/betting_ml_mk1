@@ -68,6 +68,89 @@ class NBAPredictor(nn.Module):
         x = torch.cat([p_emb, t_emb, x_cont, m_emb], dim=1)
         return self.net(x)
 
+
+class NBAPredictorV2(nn.Module):
+    """
+    Distributional Model - Outputs mean AND variance for uncertainty estimation.
+    
+    Output Shape: (B, 6) = [mean_pts, mean_reb, mean_ast, logvar_pts, logvar_reb, logvar_ast]
+    
+    Benefits:
+    - Dynamic uncertainty: Model learns when it's confident vs uncertain
+    - Better EV calculation: Use learned std instead of static MAE lookup
+    - Confidence calibration: Can validate uncertainty is well-calibrated
+    """
+    def __init__(self, num_players, num_teams, num_cont):
+        super().__init__()
+        # Embeddings
+        self.player_emb = nn.Embedding(num_players, 32, padding_idx=num_players-1)
+        self.team_emb = nn.Embedding(num_teams, 16)
+        
+        # Shared backbone
+        in_dim = 32 + 16 + num_cont + 32
+        self.backbone = nn.Sequential(
+            nn.Linear(in_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+        )
+        
+        # Separate heads for mean and variance
+        self.mean_head = nn.Linear(64, 3)  # PTS, REB, AST means
+        self.logvar_head = nn.Linear(64, 3)  # Log-variance (more stable than variance)
+        
+    def forward(self, p_idx, t_idx, x_cont, m_idx):
+        p_emb = self.player_emb(p_idx)
+        t_emb = self.team_emb(t_idx)
+        m_emb = self.player_emb(m_idx).sum(dim=1)
+        
+        x = torch.cat([p_emb, t_emb, x_cont, m_emb], dim=1)
+        features = self.backbone(x)
+        
+        mean = self.mean_head(features)
+        logvar = self.logvar_head(features)
+        
+        # Concatenate: [mean_pts, mean_reb, mean_ast, logvar_pts, logvar_reb, logvar_ast]
+        return torch.cat([mean, logvar], dim=1)
+    
+    def predict_with_uncertainty(self, p_idx, t_idx, x_cont, m_idx):
+        """
+        Returns predictions with uncertainty estimates.
+        
+        Returns:
+            mean: (B, 3) - Predicted values
+            std: (B, 3) - Standard deviations (uncertainty)
+        """
+        output = self.forward(p_idx, t_idx, x_cont, m_idx)
+        mean = output[:, :3]
+        logvar = output[:, 3:]
+        std = torch.exp(0.5 * logvar)  # Convert log-variance to std
+        return mean, std
+
+
+def gaussian_nll_loss(output, target):
+    """
+    Gaussian Negative Log Likelihood Loss.
+    
+    Trains the model to predict both mean and variance.
+    Loss = 0.5 * [log(var) + (y - mean)^2 / var]
+    
+    Args:
+        output: (B, 6) - [mean_pts, mean_reb, mean_ast, logvar_pts, logvar_reb, logvar_ast]
+        target: (B, 3) - [pts, reb, ast]
+    
+    Returns:
+        loss: scalar
+    """
+    mean = output[:, :3]
+    logvar = output[:, 3:]
+    
+    # Gaussian NLL
+    loss = 0.5 * (logvar + ((target - mean) ** 2) / torch.exp(logvar))
+    return loss.mean()
+
 class EarlyStopping:
     def __init__(self, patience=20, min_delta=0, path='checkpoint.pth'):
         self.patience = patience
@@ -124,8 +207,8 @@ def evaluate_model(model, loader, criterion, scaler, feature_cols):
         
     return avg_loss, mae_pts, mae_reb, mae_ast
 
-def train_model(target_player_id: int = None, debug: bool = False, pretrain: bool = False):
-    print(f"Training on {device} (Debug={debug}, Pretrain={pretrain})...")
+def train_model(target_player_id: int = None, debug: bool = False, pretrain: bool = False, use_v2: bool = False):
+    print(f"Training on {device} (Debug={debug}, Pretrain={pretrain}, V2={use_v2})...")
     
     # 1. Load Data
     path = os.path.join(PROCESSED_DIR, 'processed_features.csv')
@@ -254,14 +337,22 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
     
     # Model Init
     # Num Players + 1 for Padding
-    model = NBAPredictor(
-        num_players=len(player_encoder.classes_) + 1, 
-        num_teams=len(team_encoder.classes_), 
-        num_cont=len(feature_cols)
-    ).to(device)
+    if use_v2:
+        print("Using NBAPredictorV2 (Distributional Model)...")
+        model = NBAPredictorV2(
+            num_players=len(player_encoder.classes_) + 1, 
+            num_teams=len(team_encoder.classes_), 
+            num_cont=len(feature_cols)
+        ).to(device)
+    else:
+        model = NBAPredictor(
+            num_players=len(player_encoder.classes_) + 1, 
+            num_teams=len(team_encoder.classes_), 
+            num_cont=len(feature_cols)
+        ).to(device)
     
     # TRANSFER LEARNING LOGIC
-    global_model_path = os.path.join(MODELS_DIR, 'pytorch_nba_global.pth')
+    global_model_path = os.path.join(MODELS_DIR, 'pytorch_nba_global_v2.pth' if use_v2 else 'pytorch_nba_global.pth')
     if os.path.exists(global_model_path):
         print(f"Loading Global Model weights from {global_model_path}...")
         try:
@@ -274,13 +365,18 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
     else:
         print("No global model found. Training from scratch.")
     
-    criterion = nn.MSELoss()
+    # Loss function: Gaussian NLL for V2, MSE for V1
+    if use_v2:
+        criterion = gaussian_nll_loss  # Function, not nn.Module
+    else:
+        criterion = nn.MSELoss()
+    
     # Lower LR for fine-tuning
     lr = 0.001 if pretrain else 0.0005 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)
     
-    save_path = global_model_path if pretrain else os.path.join(MODELS_DIR, f'pytorch_player_{target_player_id}.pth')
+    save_path = global_model_path if pretrain else os.path.join(MODELS_DIR, f'pytorch_player_{target_player_id}{"_v2" if use_v2 else ""}.pth')
     
     early_stopping = EarlyStopping(patience=50 if not debug else 1000, path=save_path) if not (debug and not pretrain) else None
     
@@ -389,25 +485,17 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
         y_true_combined = np.concatenate(all_y_true, axis=0)
         y_pred_combined = np.concatenate(all_y_pred, axis=0)
         
-        # Inverse transform predictions and true values if scaler was used
-        # Assuming scaler was fitted on the original target columns (PTS, REB, AST)
-        # This part needs to be careful if scaler was fitted on X or y.
-        # For now, assuming scaler is for features, and targets are not scaled.
-        # If targets were scaled, we'd need to inverse_transform them.
-        # For simplicity, let's assume targets are not scaled for MAE calculation directly.
-        # If `evaluate_model` handled inverse scaling, we need to replicate that.
-        # For now, let's calculate MAE on the raw outputs.
-        # If `evaluate_model` was doing inverse scaling, this needs to be adjusted.
-        # Based on the original `evaluate_model` signature, it takes `scaler` and `feature_cols`.
-        # This implies it might be used for inverse transforming features, not targets.
-        # Let's assume the targets are not scaled for now, or that the MAE is calculated on scaled values.
-        # If `scaler` was used for targets, we'd need to inverse_transform `y_true_combined` and `y_pred_combined`.
-        # For now, let's calculate MAE directly.
+        # For V2 model, output is [mean_pts, mean_reb, mean_ast, logvar_pts, logvar_reb, logvar_ast]
+        # We only need the first 3 columns (means) for MAE calculation
+        if y_pred_combined.shape[1] == 6:  # V2 output
+            y_pred_means = y_pred_combined[:, :3]
+        else:
+            y_pred_means = y_pred_combined
         
         if len(y_true_combined) > 0:
-            mae_pts = np.mean(np.abs(y_true_combined[:, 0] - y_pred_combined[:, 0]))
-            mae_reb = np.mean(np.abs(y_true_combined[:, 1] - y_pred_combined[:, 1]))
-            mae_ast = np.mean(np.abs(y_true_combined[:, 2] - y_pred_combined[:, 2]))
+            mae_pts = np.mean(np.abs(y_true_combined[:, 0] - y_pred_means[:, 0]))
+            mae_reb = np.mean(np.abs(y_true_combined[:, 1] - y_pred_means[:, 1]))
+            mae_ast = np.mean(np.abs(y_true_combined[:, 2] - y_pred_means[:, 2]))
         else:
             mae_pts, mae_reb, mae_ast = 0, 0, 0
         
@@ -481,13 +569,15 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
         'baseline_pts': float(baseline_mae_pts),
         'baseline_reb': float(baseline_mae_reb),
         'baseline_ast': float(baseline_mae_ast),
-        'date': datetime.now().strftime('%Y-%m-%d')
+        'date': datetime.now().strftime('%Y-%m-%d'),
+        'model_version': 'v2' if use_v2 else 'v1'
     }
     
+    suffix = '_v2' if use_v2 else ''
     if pretrain:
-        metrics_path = os.path.join(DATA_DIR, 'models', 'metrics_global.json')
+        metrics_path = os.path.join(DATA_DIR, 'models', f'metrics_global{suffix}.json')
     else:
-        metrics_path = os.path.join(DATA_DIR, 'models', f'metrics_player_{target_player_id}.json')
+        metrics_path = os.path.join(DATA_DIR, 'models', f'metrics_player_{target_player_id}{suffix}.json')
         
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=4)
@@ -499,11 +589,14 @@ if __name__ == "__main__":
     parser.add_argument('--player_id', type=int, help='Player ID to train on')
     parser.add_argument('--debug', action='store_true', help='Debug mode (no early stop, plotting)')
     parser.add_argument('--pretrain', action='store_true', help='Pretrain global model on all data')
+    parser.add_argument('--v2', action='store_true', help='Use V2 distributional model (Gaussian NLL)')
     args = parser.parse_args()
     
     if args.pretrain:
-        train_model(pretrain=True)
+        train_model(pretrain=True, use_v2=args.v2)
     elif args.player_id:
-        train_model(target_player_id=args.player_id, debug=args.debug)
+        train_model(target_player_id=args.player_id, debug=args.debug, use_v2=args.v2)
     else:
         print("Please provide --player_id or --pretrain")
+        print("Add --v2 for distributional model training")
+

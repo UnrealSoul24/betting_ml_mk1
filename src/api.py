@@ -178,10 +178,18 @@ async def analyze_today(req: AnalysisRequest):
         traceback.print_exc()
         return {"results": []}
 
-    sorted_preds = sorted(results, key=lambda x: x['PRED_PTS'] if x['PRED_PTS'] else 0, reverse=True)
+    # Handle new dictionary return format (predictions + trixie)
+    if isinstance(results, dict):
+        preds_list = results.get('predictions', [])
+        trixie = results.get('trixie', None)
+    else:
+        preds_list = results
+        trixie = None
+
+    sorted_preds = sorted(preds_list, key=lambda x: x['PRED_PTS'] if x['PRED_PTS'] else 0, reverse=True)
     
     await log_manager.broadcast(f"Analysis Complete. Generated {len(sorted_preds)} predictions.")
-    return {"results": sorted_preds}
+    return {"predictions": sorted_preds, "trixie": trixie, "results": sorted_preds} # Keep 'results' for legacy compat
 
 @app.get("/health")
 def health():

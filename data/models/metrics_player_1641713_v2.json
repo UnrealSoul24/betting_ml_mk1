@@ -1,0 +1,10 @@
+{
+    "mae_pts": 4.072805881500244,
+    "mae_reb": 1.9421695470809937,
+    "mae_ast": 0.8292196989059448,
+    "baseline_pts": 4.535714149475098,
+    "baseline_reb": 2.0,
+    "baseline_ast": 0.875,
+    "date": "2026-01-23",
+    "model_version": "v2"
+}
