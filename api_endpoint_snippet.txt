@@ -1,0 +1,22 @@
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/retraining-status")
+async def get_retraining_status():
+    """
+    Returns current status of the background retraining queue.
+    
+    Useful for monitoring which players are currently being retrained
+    and checking if any retraining jobs have failed.
+    """
+    from src.retraining_queue import get_queue
+    
+    queue = get_queue()
+    status = queue.get_status()
+    
+    return {
+        "status": "ok",
+        "retraining_queue": status,
+        "message": f"{status['active']} active, {status['completed']} completed, {status['failed']} failed"
+    }

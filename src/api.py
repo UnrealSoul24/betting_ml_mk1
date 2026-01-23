@@ -82,21 +82,53 @@ async def websocket_endpoint(websocket: WebSocket):
 class AnalysisRequest(BaseModel):
     date: Optional[str] = None
     force_train: bool = False
+    check_injuries: bool = True  # New: Enable injury-triggered retraining
 
 @app.post("/analyze-today")
 async def analyze_today(req: AnalysisRequest):
     """
     Main workflow:
-    1. Get games for date
-    2. Get active active players in those games
-    3. Check if trained
-    4. Train if needed
-    5. Predict
+    1. Check for injury changes (trigger retraining if needed)
+    2. Get games for date
+    3. Get active active players in those games
+    4. Check if trained
+    5. Train if needed
+    6. Predict
     """
     target_date = req.date if req.date else datetime.now().strftime('%Y-%m-%d')
     current_season = "2025-26" # Hardcoded for now, logical
     
     await log_manager.broadcast(f"Starting Analysis for {target_date}...")
+    
+    # ==== INJURY CHANGE DETECTION ====
+    if req.check_injuries:
+        try:
+            from src.retrain_trigger import detect_injury_changes
+            from src.retraining_queue import get_queue
+            
+            await log_manager.broadcast("🏥 Checking for injury report changes...")
+            
+            injury_result = detect_injury_changes()
+            
+            if injury_result['affected_player_ids']:
+                await log_manager.broadcast(
+                    f"🚨 {len(injury_result['affected_player_ids'])} players affected by injury changes"
+                )
+                
+                # Queue retraining in background (non-blocking)
+                queue = get_queue()
+                await queue.queue_retraining(injury_result['affected_player_ids'], use_v2=True)
+                
+                await log_manager.broadcast(
+                    f"⏳ Retraining queued for affected players (running in background)"
+                )
+            else:
+                await log_manager.broadcast("✅ No injury changes detected")
+        except Exception as e:
+            await log_manager.broadcast(f"⚠️ Injury check failed: {str(e)[:100]}")
+            # Continue with predictions even if injury check fails
+    
+    # ==== CONTINUE WITH NORMAL PREDICTION FLOW ====
     
     # 1. Fetch Scoreboard
     scoreboard = fetch_daily_scoreboard(target_date)
@@ -163,6 +195,9 @@ async def analyze_today(req: AnalysisRequest):
     # However, if we need to TRAIN, we should check missing models.
     # Let's do a quick check? 
     # For now, let's SKIP training automation in favor of speed, unless explicitly requested.
+    
+    if req.force_train:
+        await log_manager.broadcast("[SKIPPED] force_train not implemented in batch mode yet.")
     # If req.force_train is True, we can't do batch effectively unless we train first.
     
     # Running Batch Analysis

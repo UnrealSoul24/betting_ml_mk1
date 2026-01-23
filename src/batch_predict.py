@@ -597,17 +597,15 @@ class BatchPredictor:
         sorted_res = sorted(results_list, key=lambda x: (x['CONSISTENCY'] * 2) + x['UNITS'], reverse=True)
         
         # QUALITY FILTER: Trixie needs STAR POWER (> 15 PPG + High Consistency)
-        trixie_candidates = [p for p in sorted_res if p.get('SEASON_PTS', 0) > 15.0]
-        if len(trixie_candidates) < 3:
-             # Fallback to > 12 PPG we don't have enough stars
-             trixie_candidates = [p for p in sorted_res if p.get('SEASON_PTS', 0) > 12.0]
-        
-        trixie = None
-        if len(trixie_candidates) >= 3:
+        if len(sorted_res) >= 3:
             legs = []
             
-            # Iterate through candidates until we have 3 valid legs
-            for p in trixie_candidates:
+            # Iterate through all candidates until we have 3 valid legs
+            # Start with stars, then everyone else
+            prioritized_candidates = [p for p in sorted_res if p.get('SEASON_PTS', 0) > 15.0]
+            rest_candidates = [p for p in sorted_res if p.get('SEASON_PTS', 0) <= 15.0]
+            
+            for p in prioritized_candidates + rest_candidates:
                 if len(legs) >= 3:
                     break
                     
@@ -633,8 +631,8 @@ class BatchPredictor:
                     # Calculate edge
                     edge = pred - market_line
                     
-                    # Lowered threshold: 0.5 for all stats to be less aggressive
-                    min_edge = 0.5
+                    # Relaxed threshold to ensure we find 3 legs
+                    min_edge = 0.1
                     
                     if edge >= min_edge:
                         # Bet OVER - our prediction exceeds the line
@@ -663,22 +661,53 @@ class BatchPredictor:
                             'source': 'market'
                         })
                 
-                # Sort by edge (highest first), take top 3 bets
-                player_bets.sort(key=lambda x: x['edge'], reverse=True)
-                selected_bets = player_bets[:3]
+                # Enforce strict structure: 1 MAIN + 2 ANCHORS
+                main_bets = [b for b in player_bets if b['type'] == 'MAIN']
+                anchor_bets = [b for b in player_bets if b['type'] == 'ANCHOR']
+                
+                # Sort anchors by edge to get the safest/best ones
+                anchor_bets.sort(key=lambda x: x['edge'], reverse=True)
+                
+                selected_bets = []
+                if main_bets and len(anchor_bets) >= 2:
+                    # Satisfies the "Trixie Maker" requirement
+                    selected_bets = [main_bets[0]] + anchor_bets[:2]
+                else:
+                    # Strict rule: if we can't make the perfect 3-leg SGP, skip this player
+                    selected_bets = []
                 
                 if selected_bets:  # Only add player if they have bettable props
+                    from src.odds_service import american_to_decimal
+                    
+                    # Calculate SGP Odds for this player
+                    sgp_odds = 1.0
+                    for bet in selected_bets:
+                        if bet['type'] == 'MAIN':
+                            # Use REAL odds for the main line
+                            real_decimal = american_to_decimal(bet.get('odds', '-110'))
+                            sgp_odds *= real_decimal
+                        else:
+                            # Use ESTIMATE for safe anchors (since we don't have alt line odds in cache)
+                            sgp_odds *= 1.35  # Safe anchor ~1.35x (-280ish)
+                    
                     legs.append({
                         **p, # Include full stats for Modal
                         'player_name': p['PLAYER_NAME'],
                         'matchup': p['MATCHUP'],
-                        'bets': selected_bets
+                        'bets': selected_bets,
+                        'sgp_odds': round(sgp_odds, 2)
                     })
 
+            # Calculate Total Trixie Odds (Product of all SGPs)
+            total_trixie_odds = 1.0
+            for leg in legs:
+                total_trixie_odds *= leg['sgp_odds']
+            
             trixie = {
                 'sgp_legs': legs,
-                'total_odds': 28.5, # TODO: Calculate from real odds
-                'rec_units': 0.25 
+                'total_odds': round(total_trixie_odds, 2),
+                'rec_units': 0.1, # Suggest small unit size for high odds (Trixie/Parlay)
+                'potential_return': round(total_trixie_odds * 0.1, 2)
             }
             
         return {'predictions': sorted_res, 'trixie': trixie}

@@ -70,50 +70,57 @@ export default function PlayerDetailModal({ isOpen, onClose, player }) {
                         </div>
                     </div>
 
-                    {/* Vegas & Market Context */}
-                    {(player.VEGAS_TOTAL || player.MARKET_LINE) && (
-                        <div className="mx-8 mt-6 p-4 bg-gradient-to-r from-amber-500/10 to-orange-500/5 border border-amber-500/20 rounded-xl">
-                            <div className="text-[10px] text-amber-400 uppercase tracking-widest mb-2 font-bold flex items-center gap-1">
-                                <Zap size={10} /> Vegas Context
+
+                    {/* Vegas & Market Context - Always Show for Consistency */}
+                    <div className="mx-8 mt-6 p-4 bg-gradient-to-r from-amber-500/10 to-orange-500/5 border border-amber-500/20 rounded-xl">
+                        <div className="text-[10px] text-amber-400 uppercase tracking-widest mb-2 font-bold flex items-center gap-1">
+                            <Zap size={10} /> Vegas Context
+                        </div>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            <div>
+                                <div className="text-[10px] text-gray-500">Game Total O/U</div>
+                                <div className={clsx("text-xl font-bold", player.VEGAS_TOTAL ? "text-white" : "text-gray-600")}>
+                                    {player.VEGAS_TOTAL || "N/A"}
+                                </div>
                             </div>
-                            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                                {player.VEGAS_TOTAL && (
-                                    <div>
-                                        <div className="text-[10px] text-gray-500">Game Total O/U</div>
-                                        <div className="text-xl font-bold text-white">{player.VEGAS_TOTAL}</div>
+
+                            <div>
+                                <div className="text-[10px] text-gray-500">Pace Adjustment</div>
+                                {player.VEGAS_ADJUSTMENT ? (
+                                    <div className={clsx(
+                                        "text-xl font-bold",
+                                        player.VEGAS_ADJUSTMENT > 1 ? "text-neon-green" : "text-red-400"
+                                    )}>
+                                        {player.VEGAS_ADJUSTMENT > 1 ? '+' : ''}{((player.VEGAS_ADJUSTMENT - 1) * 100).toFixed(1)}%
                                     </div>
+                                ) : (
+                                    <div className="text-xl font-bold text-gray-600">-</div>
                                 )}
-                                {player.VEGAS_ADJUSTMENT && (
-                                    <div>
-                                        <div className="text-[10px] text-gray-500">Pace Adjustment</div>
-                                        <div className={clsx(
-                                            "text-xl font-bold",
-                                            player.VEGAS_ADJUSTMENT > 1 ? "text-neon-green" : "text-red-400"
-                                        )}>
-                                            {player.VEGAS_ADJUSTMENT > 1 ? '+' : ''}{((player.VEGAS_ADJUSTMENT - 1) * 100).toFixed(1)}%
-                                        </div>
+                            </div>
+
+                            <div>
+                                <div className="text-[10px] text-gray-500">Market Line ({player.BEST_PROP})</div>
+                                <div className={clsx("text-xl font-bold", player.MARKET_LINE ? "text-white" : "text-gray-600")}>
+                                    {player.MARKET_LINE || "OFF"}
+                                </div>
+                            </div>
+
+                            <div>
+                                <div className="text-[10px] text-gray-500">Expected Value</div>
+                                {player.EV !== null && player.EV !== undefined ? (
+                                    <div className={clsx(
+                                        "text-xl font-bold",
+                                        player.EV > 0 ? "text-neon-green" : player.EV < -5 ? "text-red-400" : "text-gray-400"
+                                    )}>
+                                        {player.EV > 0 ? '+' : ''}{player.EV}%
                                     </div>
-                                )}
-                                {player.MARKET_LINE && (
-                                    <div>
-                                        <div className="text-[10px] text-gray-500">Market Line ({player.BEST_PROP})</div>
-                                        <div className="text-xl font-bold text-white">{player.MARKET_LINE}</div>
-                                    </div>
-                                )}
-                                {player.EV !== null && player.EV !== undefined && (
-                                    <div>
-                                        <div className="text-[10px] text-gray-500">Expected Value</div>
-                                        <div className={clsx(
-                                            "text-xl font-bold",
-                                            player.EV > 0 ? "text-neon-green" : player.EV < -5 ? "text-red-400" : "text-gray-400"
-                                        )}>
-                                            {player.EV > 0 ? '+' : ''}{player.EV}%
-                                        </div>
-                                    </div>
+                                ) : (
+                                    <div className="text-xl font-bold text-gray-600">--</div>
                                 )}
                             </div>
                         </div>
-                    )}
+                    </div>
+
 
                     {/* Consistency + Confidence Header */}
                     <div className="px-8 mt-6 flex justify-between items-end border-b border-white/5 pb-4">

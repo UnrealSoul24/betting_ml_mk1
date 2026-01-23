@@ -1,6 +1,106 @@
 import pandas as pd
 import requests
 import io
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+# Paths
+DATA_DIR = Path(__file__).parent / "../data"
+CACHE_DIR = DATA_DIR / "cache"
+INJURY_CACHE_PATH = CACHE_DIR / "injury_state.json"
+INJURY_ARCHIVE_DIR = CACHE_DIR / "injury_archives"
+
+# Ensure directories exist
+CACHE_DIR.mkdir(exist_ok=True, parents=True)
+INJURY_ARCHIVE_DIR.mkdir(exist_ok=True, parents=True)
+
+def load_injury_cache():
+    """Loads the last saved injury state from cache."""
+    if not INJURY_CACHE_PATH.exists():
+        return {"last_updated": None, "injuries": {}}
+    
+    try:
+        with open(INJURY_CACHE_PATH, 'r') as f:
+            return json.load(f)
+    except:
+        return {"last_updated": None, "injuries": {}}
+
+def save_injury_cache(injury_report: dict):
+    """Saves current injury report to cache with timestamp."""
+    cache_data = {
+        "last_updated": datetime.now().isoformat(),
+        "injuries": injury_report
+    }
+    
+    with open(INJURY_CACHE_PATH, 'w') as f:
+        json.dump(cache_data, f, indent=2)
+    
+    # Also archive this snapshot
+    archive_injury_report(injury_report)
+
+def archive_injury_report(report: dict):
+    """Archives daily injury snapshot for historical backfilling."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    archive_path = INJURY_ARCHIVE_DIR / f"{today}.json"
+    
+    with open(archive_path, 'w') as f:
+        json.dump({
+            "date": today,
+            "injuries": report
+        }, f, indent=2)
+    
+    print(f"[InjuryService] Archived injury report to {archive_path}")
+
+def compare_injury_states(old_state: dict, new_state: dict):
+    """
+    Compares two injury states and returns what changed.
+    
+    Returns:
+        dict with:
+        - new_injuries: Players newly listed as Out
+        - returns: Players who were Out, now Active
+        - status_changes: Players whose status changed
+        - all_affected: Set of all player names affected
+    """
+    old_injuries = old_state.get("injuries", {})
+    new_injuries = new_state
+    
+    changes = {
+        "new_injuries": [],
+        "returns": [],
+        "status_changes": [],
+        "all_affected": set()
+    }
+    
+    # Find new injuries
+    for player, status in new_injuries.items():
+        if player not in old_injuries:
+            if status == "Out":
+                changes["new_injuries"].append(player)
+                changes["all_affected"].add(player)
+        else:
+            old_status = old_injuries[player]
+            if old_status != status:
+                changes["status_changes"].append({
+                    "player": player,
+                    "old": old_status,
+                    "new": status
+                })
+                changes["all_affected"].add(player)
+                
+                # Track significant changes
+                if status == "Out" and old_status != "Out":
+                    changes["new_injuries"].append(player)
+    
+    # Find returns (players no longer listed)
+    for player, status in old_injuries.items():
+        if player not in new_injuries and status == "Out":
+            changes["returns"].append(player)
+            changes["all_affected"].add(player)
+    
+    return changes
 
 def get_injury_report():
     """
@@ -80,8 +180,34 @@ def get_injury_report():
         return {}
 
 if __name__ == "__main__":
-    # Test
+    # Test cache functionality
+    print("Testing injury cache system...")
+    
+    # Fetch current report
     report = get_injury_report()
+    
+    # Load old cache
+    old_cache = load_injury_cache()
+    
+    # Compare
+    changes = compare_injury_states(old_cache, report)
+    
+    if changes['all_affected']:
+        print(f"\n🚨 INJURY CHANGES DETECTED: {len(changes['all_affected'])} players affected")
+        if changes['new_injuries']:
+            print(f"  New Injuries/Out: {changes['new_injuries']}")
+        if changes['returns']:
+            print(f"  Returns: {changes['returns']}")
+        if changes['status_changes']:
+            print(f"  Status Changes: {len(changes['status_changes'])}")
+    else:
+        print("\n✅ No injury changes since last check")
+    
+    # Save new cache
+    save_injury_cache(report)
+    
+    # Show all Out players
+    print("\nPlayers currently OUT:")
     for p, s in report.items():
         if s == "Out":
-            print(f"{p}: {s}")
+            print(f"  - {p}")

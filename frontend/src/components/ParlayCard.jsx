@@ -25,7 +25,7 @@ export default function ParlayCard({ trixie, onLegClick }) {
                         <div className="text-right">
                             <div className="text-xs text-gray-500 uppercase font-mono">Total Odds</div>
                             <div className="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-neon-purple to-white">
-                                ~3.14x
+                                {trixie.total_odds.toFixed(2)}x
                             </div>
                         </div>
                     </div>
@@ -70,7 +70,7 @@ export default function ParlayCard({ trixie, onLegClick }) {
 
                                 <div className="mt-3 pt-2 border-t border-white/5 text-center">
                                     <span className="text-[10px] text-gray-400">Total SGP Odds</span>
-                                    <div className="text-white font-mono font-bold">~3.10x</div>
+                                    <div className="text-white font-mono font-bold">{leg.sgp_odds?.toFixed(2) || "-"}x</div>
                                 </div>
                             </div>
                         ))}
