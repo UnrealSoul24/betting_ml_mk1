@@ -38,47 +38,11 @@ class NBADataset(Dataset):
         return p_idx, t_idx, x_cont, m_idx, self.y[idx]
 
 class NBAPredictor(nn.Module):
-    def __init__(self, num_players, num_teams, num_cont):
-        super().__init__()
-        # Embeddings
-        # num_players includes Padding Index (last one)
-        self.player_emb = nn.Embedding(num_players, 32, padding_idx=num_players-1)
-        self.team_emb = nn.Embedding(num_teams, 16)
-        
-        # MLP
-        # Input: Player(32) + Team(16) + Continuous + Missing(32)
-        in_dim = 32 + 16 + num_cont + 32
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 3) # PTS, REB, AST
-        )
-        
-    def forward(self, p_idx, t_idx, x_cont, m_idx):
-        p_emb = self.player_emb(p_idx) # (B, 32)
-        t_emb = self.team_emb(t_idx)   # (B, 16)
-        
-        # Missing Players: (B, K) -> (B, K, 32) -> Sum(1) -> (B, 32)
-        m_emb = self.player_emb(m_idx).sum(dim=1)
-        
-        x = torch.cat([p_emb, t_emb, x_cont, m_emb], dim=1)
-        return self.net(x)
-
-
-class NBAPredictorV2(nn.Module):
     """
     Distributional Model - Outputs mean AND variance for uncertainty estimation.
+    Now supports 6 targets: PTS, REB, AST, FG3M, BLK, STL
     
-    Output Shape: (B, 6) = [mean_pts, mean_reb, mean_ast, logvar_pts, logvar_reb, logvar_ast]
-    
-    Benefits:
-    - Dynamic uncertainty: Model learns when it's confident vs uncertain
-    - Better EV calculation: Use learned std instead of static MAE lookup
-    - Confidence calibration: Can validate uncertainty is well-calibrated
+    Output Shape: (B, 12) = [mean_6, logvar_6]
     """
     def __init__(self, num_players, num_teams, num_cont):
         super().__init__()
@@ -97,9 +61,9 @@ class NBAPredictorV2(nn.Module):
             nn.Dropout(0.2),
         )
         
-        # Separate heads for mean and variance
-        self.mean_head = nn.Linear(64, 3)  # PTS, REB, AST means
-        self.logvar_head = nn.Linear(64, 3)  # Log-variance (more stable than variance)
+        # Separate heads for mean and variance (6 targets)
+        self.mean_head = nn.Linear(64, 6)  # PTS, REB, AST, FG3M, BLK, STL
+        self.logvar_head = nn.Linear(64, 6)  # Log-variance
         
     def forward(self, p_idx, t_idx, x_cont, m_idx):
         p_emb = self.player_emb(p_idx)
@@ -112,22 +76,18 @@ class NBAPredictorV2(nn.Module):
         mean = self.mean_head(features)
         logvar = self.logvar_head(features)
         
-        # Concatenate: [mean_pts, mean_reb, mean_ast, logvar_pts, logvar_reb, logvar_ast]
+        # Concatenate: [mean(6), logvar(6)]
         return torch.cat([mean, logvar], dim=1)
     
     def predict_with_uncertainty(self, p_idx, t_idx, x_cont, m_idx):
-        """
-        Returns predictions with uncertainty estimates.
-        
-        Returns:
-            mean: (B, 3) - Predicted values
-            std: (B, 3) - Standard deviations (uncertainty)
-        """
         output = self.forward(p_idx, t_idx, x_cont, m_idx)
-        mean = output[:, :3]
-        logvar = output[:, 3:]
-        std = torch.exp(0.5 * logvar)  # Convert log-variance to std
+        mean = output[:, :6]
+        logvar = output[:, 6:]
+        std = torch.exp(0.5 * logvar)
         return mean, std
+
+
+
 
 
 def gaussian_nll_loss(output, target):
@@ -138,14 +98,15 @@ def gaussian_nll_loss(output, target):
     Loss = 0.5 * [log(var) + (y - mean)^2 / var]
     
     Args:
-        output: (B, 6) - [mean_pts, mean_reb, mean_ast, logvar_pts, logvar_reb, logvar_ast]
-        target: (B, 3) - [pts, reb, ast]
+    Args:
+        output: (B, 12) - [mean(6), logvar(6)]
+        target: (B, 6) - [pts, reb, ast, 3pm, blk, stl]
     
     Returns:
         loss: scalar
     """
-    mean = output[:, :3]
-    logvar = output[:, 3:]
+    mean = output[:, :6]
+    logvar = output[:, 6:]
     
     # Gaussian NLL
     loss = 0.5 * (logvar + ((target - mean) ** 2) / torch.exp(logvar))
@@ -207,8 +168,8 @@ def evaluate_model(model, loader, criterion, scaler, feature_cols):
         
     return avg_loss, mae_pts, mae_reb, mae_ast
 
-def train_model(target_player_id: int = None, debug: bool = False, pretrain: bool = False, use_v2: bool = False):
-    print(f"Training on {device} (Debug={debug}, Pretrain={pretrain}, V2={use_v2})...")
+def train_model(target_player_id: int = None, debug: bool = False, pretrain: bool = False):
+    print(f"Training on {device} (Debug={debug}, Pretrain={pretrain})...")
     
     # 1. Load Data
     path = os.path.join(PROCESSED_DIR, 'processed_features.csv')
@@ -248,13 +209,13 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
     # Separate numeric features from Metadata
     # X needs: PLAYER_IDX, TEAM_IDX, Continuous Features
     
-    feature_cols = [c for c in df.columns if c not in ['PLAYER_ID', 'GAME_DATE', 'MATCHUP', 'PTS', 'REB', 'AST', 'PLAYER_NAME', 'TEAM_ID', 'SEASON_YEAR', 'PLAYER_IDX', 'TEAM_IDX', 'MISSING_PLAYER_IDS']]
+    feature_cols = [c for c in df.columns if c not in ['PLAYER_ID', 'GAME_DATE', 'MATCHUP', 'PTS', 'REB', 'AST', 'FG3M', 'BLK', 'STL', 'PLAYER_NAME', 'TEAM_ID', 'SEASON_YEAR', 'PLAYER_IDX', 'TEAM_IDX', 'MISSING_PLAYER_IDS']]
     
     # Save feature columns
     joblib.dump(feature_cols, os.path.join(MODELS_DIR, 'feature_cols.joblib'))
     
     X = df[['PLAYER_IDX', 'TEAM_IDX'] + feature_cols].values.astype(np.float32)
-    y = df[['PTS', 'REB', 'AST']].values.astype(np.float32)
+    y = df[['PTS', 'REB', 'AST', 'FG3M', 'BLK', 'STL']].values.astype(np.float32)
     
     # ---- PROCESS MISSING IDS ----
     print("Processing Missing Player Embeddings...")
@@ -306,7 +267,7 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
     y_train = y[train_indices]
     y_val = y[val_indices]
     
-    baseline_preds = np.mean(y_train, axis=0) # [PTS, REB, AST]
+    baseline_preds = np.mean(y_train, axis=0) # [PTS, REB, AST, 3PM, BLK, STL]
     baseline_mae = np.mean(np.abs(y_val - baseline_preds), axis=0)
     
     baseline_mae_pts = baseline_mae[0]
@@ -336,23 +297,14 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
     
     # Model Init
-    # Num Players + 1 for Padding
-    if use_v2:
-        print("Using NBAPredictorV2 (Distributional Model)...")
-        model = NBAPredictorV2(
-            num_players=len(player_encoder.classes_) + 1, 
-            num_teams=len(team_encoder.classes_), 
-            num_cont=len(feature_cols)
-        ).to(device)
-    else:
-        model = NBAPredictor(
-            num_players=len(player_encoder.classes_) + 1, 
-            num_teams=len(team_encoder.classes_), 
-            num_cont=len(feature_cols)
-        ).to(device)
+    model = NBAPredictor(
+        num_players=len(player_encoder.classes_) + 1, 
+        num_teams=len(team_encoder.classes_), 
+        num_cont=len(feature_cols)
+    ).to(device)
     
     # TRANSFER LEARNING LOGIC
-    global_model_path = os.path.join(MODELS_DIR, 'pytorch_nba_global_v2.pth' if use_v2 else 'pytorch_nba_global.pth')
+    global_model_path = os.path.join(MODELS_DIR, 'pytorch_nba_global_vNext.pth') # vNext to avoid conflict/ensure refresh
     if os.path.exists(global_model_path):
         print(f"Loading Global Model weights from {global_model_path}...")
         try:
@@ -366,17 +318,15 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
         print("No global model found. Training from scratch.")
     
     # Loss function: Gaussian NLL for V2, MSE for V1
-    if use_v2:
-        criterion = gaussian_nll_loss  # Function, not nn.Module
-    else:
-        criterion = nn.MSELoss()
+    # Loss function
+    criterion = gaussian_nll_loss
     
     # Lower LR for fine-tuning
     lr = 0.001 if pretrain else 0.0005 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)
     
-    save_path = global_model_path if pretrain else os.path.join(MODELS_DIR, f'pytorch_player_{target_player_id}{"_v2" if use_v2 else ""}.pth')
+    save_path = global_model_path if pretrain else os.path.join(MODELS_DIR, f'pytorch_player_{target_player_id}.pth')
     
     early_stopping = EarlyStopping(patience=50 if not debug else 1000, path=save_path) if not (debug and not pretrain) else None
     
@@ -485,12 +435,8 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
         y_true_combined = np.concatenate(all_y_true, axis=0)
         y_pred_combined = np.concatenate(all_y_pred, axis=0)
         
-        # For V2 model, output is [mean_pts, mean_reb, mean_ast, logvar_pts, logvar_reb, logvar_ast]
-        # We only need the first 3 columns (means) for MAE calculation
-        if y_pred_combined.shape[1] == 6:  # V2 output
-            y_pred_means = y_pred_combined[:, :3]
-        else:
-            y_pred_means = y_pred_combined
+        # Distributional output is [mean(6), logvar(6)]
+        y_pred_means = y_pred_combined[:, :6]
         
         if len(y_true_combined) > 0:
             mae_pts = np.mean(np.abs(y_true_combined[:, 0] - y_pred_means[:, 0]))
@@ -570,14 +516,13 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
         'baseline_reb': float(baseline_mae_reb),
         'baseline_ast': float(baseline_mae_ast),
         'date': datetime.now().strftime('%Y-%m-%d'),
-        'model_version': 'v2' if use_v2 else 'v1'
+        'model_version': 'vNext'
     }
     
-    suffix = '_v2' if use_v2 else ''
     if pretrain:
-        metrics_path = os.path.join(DATA_DIR, 'models', f'metrics_global{suffix}.json')
+        metrics_path = os.path.join(DATA_DIR, 'models', 'metrics_global.json')
     else:
-        metrics_path = os.path.join(DATA_DIR, 'models', f'metrics_player_{target_player_id}{suffix}.json')
+        metrics_path = os.path.join(DATA_DIR, 'models', f'metrics_player_{target_player_id}.json')
         
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=4)
@@ -593,10 +538,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     if args.pretrain:
-        train_model(pretrain=True, use_v2=args.v2)
+        train_model(pretrain=True)
     elif args.player_id:
-        train_model(target_player_id=args.player_id, debug=args.debug, use_v2=args.v2)
+        train_model(target_player_id=args.player_id, debug=args.debug)
     else:
         print("Please provide --player_id or --pretrain")
-        print("Add --v2 for distributional model training")
 

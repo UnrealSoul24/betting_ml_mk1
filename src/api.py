@@ -16,7 +16,12 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from src.data_fetch import fetch_daily_scoreboard
 from src.daily_predict import predict_daily
 from src.train_models import train_model
+from src.train_models import train_model
 from nba_api.stats.endpoints import commonteamroster
+
+# Constants
+DATA_DIR = os.path.join(os.path.dirname(__file__), '../data')
+MODELS_DIR = os.path.join(DATA_DIR, 'models')
 
 app = FastAPI()
 
@@ -182,8 +187,52 @@ async def analyze_today(req: AnalysisRequest):
 
     total_players = len(execution_list)
     await log_manager.broadcast(f"Plan Built: {total_players} Players identified across {total_teams} Teams.")
-    
-    # 3. Execute BATCH
+
+    # ---------------------------------------------------------
+    # 3. ON-DEMAND TRAINING (Missing Models)
+    # ---------------------------------------------------------
+    await log_manager.broadcast("Checking for missing player models...")
+    missing_pids = []
+
+    for item in execution_list:
+        pid = item['pid']
+        # Check if pytorch_player_{pid}.pth exists
+        # Note: train_models.py now saves as pytorch_player_{pid}.pth (v2 suffix removed)
+        model_path = os.path.join(MODELS_DIR, f'pytorch_player_{pid}.pth')
+        
+        # Also check if we have a global model fallback? 
+        # User requested specific models to be trained.
+        if not os.path.exists(model_path):
+            missing_pids.append(item)
+            
+    if missing_pids:
+        count = len(missing_pids)
+        await log_manager.broadcast(f"⚠️ Found {count} players with missing models. Training them now...")
+        
+        for i, item in enumerate(missing_pids):
+            pid = item['pid']
+            pname = item['pname']
+            
+            # Skip if recently processed in this loop (duplicates?)
+            # execution_list is unique by nature of loop? No, roster is unique.
+            
+            msg = f"Training [{i+1}/{count}]: {pname}..."
+            await log_manager.broadcast(msg)
+            
+            try:
+                # Run training in thread to avoid blocking WebSocket heartbeats
+                # using asyncio.to_thread (requires Python 3.9+)
+                await asyncio.to_thread(train_model, target_player_id=pid)
+            except Exception as e:
+                await log_manager.broadcast(f"❌ Failed to train {pname}: {e}")
+                
+        await log_manager.broadcast("✅ On-demand training complete.")
+    else:
+        await log_manager.broadcast("✅ All player models present.")
+
+    # ---------------------------------------------------------
+    # 4. Execute BATCH
+    # ---------------------------------------------------------
     from src.batch_predict import BatchPredictor
     batch_predictor = BatchPredictor()
     
@@ -196,9 +245,17 @@ async def analyze_today(req: AnalysisRequest):
     # Let's do a quick check? 
     # For now, let's SKIP training automation in favor of speed, unless explicitly requested.
     
-    if req.force_train:
-        await log_manager.broadcast("[SKIPPED] force_train not implemented in batch mode yet.")
     # If req.force_train is True, we can't do batch effectively unless we train first.
+    if req.force_train:
+         await log_manager.broadcast("Force Train requested. Retraining ALL identified players...")
+         for i, item in enumerate(execution_list):
+            pid = item['pid']
+            pname = item['pname']
+            await log_manager.broadcast(f"Force Retrain [{i+1}/{total_players}]: {pname}...")
+            try:
+                await asyncio.to_thread(train_model, target_player_id=pid)
+            except Exception as e:
+                 await log_manager.broadcast(f"Failed to train {pname}: {e}")
     
     # Running Batch Analysis
     try:
@@ -221,7 +278,8 @@ async def analyze_today(req: AnalysisRequest):
         preds_list = results
         trixie = None
 
-    sorted_preds = sorted(preds_list, key=lambda x: x['PRED_PTS'] if x['PRED_PTS'] else 0, reverse=True)
+    # sorted_preds = sorted(preds_list, key=lambda x: x['PRED_PTS'] if x['PRED_PTS'] else 0, reverse=True)
+    sorted_preds = preds_list # Already sorted by BatchPredictor (Tier -> Units -> Consistency)
     
     await log_manager.broadcast(f"Analysis Complete. Generated {len(sorted_preds)} predictions.")
     return {"predictions": sorted_preds, "trixie": trixie, "results": sorted_preds} # Keep 'results' for legacy compat

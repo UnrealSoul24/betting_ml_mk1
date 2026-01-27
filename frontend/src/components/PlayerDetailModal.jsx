@@ -209,9 +209,18 @@ export default function PlayerDetailModal({ isOpen, onClose, player }) {
                                 <div>Safe Line</div>
                             </div>
 
-                            {['PTS', 'REB', 'AST'].map(stat => {
+                            {['PTS', 'REB', 'AST', '3PM', 'BLK', 'STL'].map(stat => {
                                 const sea = player[`SEASON_${stat}`] || 0;
-                                const l5 = player.LAST_5 ? (stat === 'PTS' ? player.LAST_5.avg_pts : stat === 'REB' ? player.LAST_5.avg_reb : player.LAST_5.avg_ast) : 0;
+                                let l5 = 0;
+                                if (player.LAST_5) {
+                                    if (stat === 'PTS') l5 = player.LAST_5.avg_pts;
+                                    else if (stat === 'REB') l5 = player.LAST_5.avg_reb;
+                                    else if (stat === 'AST') l5 = player.LAST_5.avg_ast;
+                                    else if (stat === '3PM') l5 = player.LAST_5.avg_3pm;
+                                    else if (stat === 'BLK') l5 = player.LAST_5.avg_blk;
+                                    else if (stat === 'STL') l5 = player.LAST_5.avg_stl;
+                                }
+
                                 const proj = player[`PRED_${stat}`] || 0;
                                 const mae = player[`MAE_${stat}`] || 0;
                                 const safe = player[`LINE_${stat}_LOW`] || 0;

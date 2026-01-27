@@ -219,7 +219,7 @@ export default function App() {
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {predictions.predictions.slice(0, 50).map((pred, i) => (
+              {predictions.predictions.map((pred, i) => (
                 <BetCard
                   key={i}
                   pred={pred}

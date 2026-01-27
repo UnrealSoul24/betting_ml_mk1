@@ -30,9 +30,12 @@ export default function BetCard({ pred, onClick, index }) {
             {/* Stats Grid */}
             <div className="grid grid-cols-3 gap-2 mb-4 bg-black/40 p-2 rounded-xl border border-white/5">
                 {[
-                    { label: 'PTS', val: pred.PRED_PTS, low: pred.LINE_PTS_LOW, high: pred.LINE_PTS_HIGH },
-                    { label: 'REB', val: pred.PRED_REB, low: pred.LINE_REB_LOW, high: pred.LINE_REB_HIGH },
-                    { label: 'AST', val: pred.PRED_AST, low: pred.LINE_AST_LOW, high: pred.LINE_AST_HIGH },
+                    { label: 'PTS', val: pred.PRED_PTS },
+                    { label: 'REB', val: pred.PRED_REB },
+                    { label: 'AST', val: pred.PRED_AST },
+                    { label: '3PM', val: pred.PRED_3PM },
+                    { label: 'BLK', val: pred.PRED_BLK },
+                    { label: 'STL', val: pred.PRED_STL },
                 ].map((stat) => (
                     <div key={stat.label} className={clsx(
                         "text-center p-1 rounded",

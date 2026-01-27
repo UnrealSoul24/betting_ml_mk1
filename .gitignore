@@ -179,3 +179,10 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Project Specific Generated Files
+data/models/*.pth
+data/models/*.json
+data/models/*.joblib
+data/cache/
+processed_features.csv

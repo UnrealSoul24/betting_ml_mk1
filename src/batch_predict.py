@@ -6,7 +6,7 @@ import joblib
 from datetime import datetime
 from src.data_fetch import fetch_daily_scoreboard
 from src.feature_engineer import FeatureEngineer
-from src.train_models import NBAPredictor, NBAPredictorV2
+from src.train_models import NBAPredictor
 from src.odds_service import fetch_nba_odds, get_ev_for_prediction, get_game_total_for_matchup
 from nba_api.stats.static import teams
 import asyncio
@@ -17,11 +17,10 @@ MODELS_DIR = os.path.join(DATA_DIR, 'models')
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class BatchPredictor:
-    def __init__(self, use_v2: bool = True):
+    def __init__(self):
         self.fe = FeatureEngineer()
         self.resources = {} # Cache resources
         self.models_cache = {} # Cache loaded PyTorch models
-        self.use_v2 = use_v2  # Use distributional model
 
     def load_common_resources(self):
         print("Loading common resources...")
@@ -31,17 +30,9 @@ class BatchPredictor:
         self.resources['feature_cols'] = joblib.load(os.path.join(MODELS_DIR, 'feature_cols.joblib'))
         
     def _get_model(self, player_id: int):
-        # Determine model path - prefer V2 if enabled
-        suffix = '_v2' if self.use_v2 else ''
-        specific_path = os.path.join(MODELS_DIR, f'pytorch_player_{player_id}{suffix}.pth')
-        generic_path = os.path.join(MODELS_DIR, f'pytorch_nba_global{suffix}.pth')
-        
-        # Fallback to V1 if V2 doesn't exist
-        if self.use_v2 and not os.path.exists(generic_path):
-            print(f"[Warning] V2 model not found, falling back to V1")
-            self.use_v2 = False
-            generic_path = os.path.join(MODELS_DIR, 'pytorch_nba_global.pth')
-            specific_path = os.path.join(MODELS_DIR, f'pytorch_player_{player_id}.pth')
+        # Determine model path
+        specific_path = os.path.join(MODELS_DIR, f'pytorch_player_{player_id}.pth')
+        generic_path = os.path.join(MODELS_DIR, 'pytorch_nba_global_vNext.pth')
         
         path_to_load = specific_path if os.path.exists(specific_path) else generic_path
         
@@ -58,21 +49,20 @@ class BatchPredictor:
         num_teams = len(t_enc.classes_)
         num_cont = len(f_cols)
         
-        # Use V2 model if enabled
-        if self.use_v2:
-            model = NBAPredictorV2(num_players, num_teams, num_cont)
-        else:
-            model = NBAPredictor(num_players, num_teams, num_cont)
+        # Init Model (New Arch: 6 targets)
+        model = NBAPredictor(num_players, num_teams, num_cont)
         
         # Safely load weights
         try:
             model.load_state_dict(torch.load(path_to_load, map_location=device))
-            print(f"[Model] Loaded {'V2' if self.use_v2 else 'V1'} model from {os.path.basename(path_to_load)}")
+            # print(f"[Model] Loaded model from {os.path.basename(path_to_load)}")
         except Exception as e:
             print(f"Error loading model {path_to_load}: {e}")
             # Fallback to generic if specific failed?
-            if path_to_load != generic_path:
-                model.load_state_dict(torch.load(generic_path, map_location=device))
+            if path_to_load != generic_path and os.path.exists(generic_path):
+                 try:
+                    model.load_state_dict(torch.load(generic_path, map_location=device))
+                 except: pass
             
         model.to(device)
         model.eval()
@@ -237,8 +227,12 @@ class BatchPredictor:
             # But let's just assume DataFrame lookup is fast enough for 200 items.
             
         # --- INJURY REPORT ---
-        from src.injury_service import get_injury_report
-        injury_map = get_injury_report()
+        # --- INJURY REPORT ---
+        from src.injury_service import load_injury_cache
+        injury_cache = load_injury_cache()
+        injury_map = injury_cache.get('injuries', {})
+        if log_manager: await log_manager.broadcast(f"Loaded {len(injury_map)} injuries from cache for filtering.")
+        # ---------------------
         # ---------------------
         
         player_ids = today_data['PLAYER_ID'].unique()
@@ -263,6 +257,9 @@ class BatchPredictor:
                         break
             
             if injury_status == "Out":
+                # if log_manager: await log_manager.broadcast(f"  🚫 Skipping {pname} (Out)") 
+                # Commented out to reduce noise, but good for debug
+                print(f"Skipping {pname} (Out)")
                 continue
                 
             processed_count += 1
@@ -289,29 +286,39 @@ class BatchPredictor:
                 
             preds_np = preds.cpu().numpy()
             
-            # Handle V2 model output (6 columns: mean + logvar) vs V1 (3 columns: mean only)
-            if preds_np.shape[1] == 6:  # V2 model
+            # Handle (6 targets: PTS, REB, AST, 3PM, BLK, STL)
+            if preds_np.shape[1] == 12:  # 6 means + 6 logvars
                 pred_pts = float(preds_np[0, 0])
                 pred_reb = float(preds_np[0, 1])
                 pred_ast = float(preds_np[0, 2])
+                pred_3pm = float(preds_np[0, 3])
+                pred_blk = float(preds_np[0, 4])
+                pred_stl = float(preds_np[0, 5])
+                
                 # Extract learned std from log-variance
-                std_pts = float(np.exp(0.5 * preds_np[0, 3]))
-                std_reb = float(np.exp(0.5 * preds_np[0, 4]))
-                std_ast = float(np.exp(0.5 * preds_np[0, 5]))
-                # Use learned std as MAE proxy (more dynamic!)
+                std_pts = float(np.exp(0.5 * preds_np[0, 6]))
+                std_reb = float(np.exp(0.5 * preds_np[0, 7]))
+                std_ast = float(np.exp(0.5 * preds_np[0, 8]))
+                std_3pm = float(np.exp(0.5 * preds_np[0, 9]))
+                std_blk = float(np.exp(0.5 * preds_np[0, 10]))
+                std_stl = float(np.exp(0.5 * preds_np[0, 11]))
+                
+                # Use learned std as MAE proxy
                 mae_pts = std_pts
                 mae_reb = std_reb
                 mae_ast = std_ast
+                mae_3pm = std_3pm
+                mae_blk = std_blk
+                mae_stl = std_stl
+                
                 mae_pra = mae_pts + mae_reb + mae_ast
-            else:  # V1 model - use static MAE lookup
-                pred_pts = float(preds_np[0, 0])
-                pred_reb = float(preds_np[0, 1])
-                pred_ast = float(preds_np[0, 2])
-                metrics = self._get_metrics(pid)
-                mae_pts = metrics.get('mae_pts', 6.0)
-                mae_reb = metrics.get('mae_reb', 2.5)
-                mae_ast = metrics.get('mae_ast', 2.0)
-                mae_pra = mae_pts + mae_reb + mae_ast
+            else:
+                # Should not happen if models match, but fallback just in case
+                pred_pts, pred_reb, pred_ast = 0,0,0
+                pred_3pm, pred_blk, pred_stl = 0,0,0
+                mae_pts, mae_reb, mae_ast = 1,1,1
+                mae_3pm, mae_blk, mae_stl = 1,1,1
+                mae_pra = 3
             
             # --- VEGAS GAME TOTAL ADJUSTMENT ---
             # High game totals (e.g., 230+) imply fast pace → more scoring opportunity
@@ -369,11 +376,16 @@ class BatchPredictor:
             pred_pts = max(0.0, float(pred_pts))
             pred_reb = max(0.0, float(pred_reb))
             pred_ast = max(0.0, float(pred_ast))
+            pred_3pm = max(0.0, float(pred_3pm))
+            pred_blk = max(0.0, float(pred_blk))
+            pred_stl = max(0.0, float(pred_stl))
             pred_pra = pred_pts + pred_reb + pred_ast
             
-            # 2. Relevance Filter (No bench warmers)
+            # 2. Relevance Filter (Restore Strict Filter per User Request)
             if season_pts < 8.0 and pred_pts < 10.0:
                  continue
+            # if season_pts < 1.0 and pred_pts < 1.0: # Only skip absolute zeros
+            #      continue
 
             valid_bets = []
             
@@ -382,7 +394,10 @@ class BatchPredictor:
                 ('PTS', pred_pts, mae_pts, last_5.get('avg_pts', 0)),
                 ('REB', pred_reb, mae_reb, last_5.get('avg_reb', 0)),
                 ('AST', pred_ast, mae_ast, last_5.get('avg_ast', 0)),
-                ('PRA', pred_pra, mae_pra, last_5.get('avg_pra', 0))
+                ('PRA', pred_pra, mae_pra, last_5.get('avg_pra', 0)),
+                ('3PM', pred_3pm, mae_3pm, 0), # No last 5 data yet for these
+                ('BLK', pred_blk, mae_blk, 0),
+                ('STL', pred_stl, mae_stl, 0)
             ]
             
             # Smart Unit Logic
@@ -487,13 +502,13 @@ class BatchPredictor:
                 if units >= 0.75: badge = "GOLD 🥇"
                 if units >= 1.0: badge = "DIAMOND 💎"
                 
-                # Filter out tiny bets
+                # Filter out tiny bets? NO, keep them but mark as NO BET if 0
                 if units < 0.25: 
-                    # If it's positive but small, just show as Lean 0.25 or skip?
-                    # Let's keep 0.25 as min if there is positive edge
                     if f_star > 0: units = 0.25
-                    else: continue # No edge
+                    else: units = 0.0 # No Edge
                 
+                # Check against highest
+                # If units > highest, take it.
                 if units > highest_score:
                     highest_score = units
                     best_prop = {
@@ -502,15 +517,23 @@ class BatchPredictor:
                         'line_low': val - mae,
                         'line_high': val + mae,
                         'units': units,
-                        'badge': badge,
+                        'badge': badge if units >= 0.25 else "NO BET", # Show NO BET
                         'consistency': consistency_score,
                         'mae': mae
                     }
 
+            # Fallback if no prop found (e.g. all 0 units)
             if best_prop is None:
-                continue
-
-            # Get Season Stats (Already calculated above)
+                 best_prop = {
+                        'prop': 'PTS', # Default
+                        'val': pred_pts,
+                        'line_low': pred_pts - mae_pts,
+                        'line_high': pred_pts + mae_pts,
+                        'units': 0.0,
+                        'badge': "NO BET",
+                        'consistency': 0.5,
+                        'mae': mae_pts
+                    }
 
             # Get Season Stats (Already calculated above)
             # season_stats = self._get_season_stats(pid, df_history)
@@ -526,15 +549,20 @@ class BatchPredictor:
                 # Full Stats
                 'PRED_PTS': float(pred_pts), 'PRED_REB': float(pred_reb), 'PRED_AST': float(pred_ast), 'PRED_PRA': float(pred_pra),
                 'PRED_PR': float(pred_pr), 'PRED_PA': float(pred_pa), 'PRED_RA': float(pred_ra),
+                'PRED_3PM': float(pred_3pm), 'PRED_BLK': float(pred_blk), 'PRED_STL': float(pred_stl),
                 
                 # Season Context 
                 'SEASON_PTS': float(season_stats.get('pts', 0)),
                 'SEASON_REB': float(season_stats.get('reb', 0)),
                 'SEASON_AST': float(season_stats.get('ast', 0)),
+                'SEASON_3PM': float(season_stats.get('3pm', 0)),
+                'SEASON_BLK': float(season_stats.get('blk', 0)),
+                'SEASON_STL': float(season_stats.get('stl', 0)),
                 'SEASON_PRA': float(season_stats.get('pra', 0)),
                 
                 # MAE
                 'MAE_PTS': float(mae_pts), 'MAE_REB': float(mae_reb), 'MAE_AST': float(mae_ast), 'MAE_PRA': float(mae_pra),
+                'MAE_3PM': float(mae_3pm), 'MAE_BLK': float(mae_blk), 'MAE_STL': float(mae_stl),
 
                 # Safe Lines (for UI Grid)
                 'LINE_PTS_LOW': float(pred_pts - mae_pts), 'LINE_PTS_HIGH': float(pred_pts + mae_pts),
@@ -559,8 +587,8 @@ class BatchPredictor:
                 'VEGAS_ADJUSTMENT': round(vegas_adjustment, 3) if vegas_adjustment != 1.0 else None,
                 
                 # Model Info
-                'MODEL_VERSION': 'V2' if (preds_np.shape[1] == 6) else 'V1',
-                'UNCERTAINTY_SOURCE': 'learned' if (preds_np.shape[1] == 6) else 'static_mae',
+                'MODEL_VERSION': 'V2',
+                'UNCERTAINTY_SOURCE': 'learned',
                 
                 # Market Odds (populated below)
                 'MARKET_LINE': None,
@@ -592,9 +620,26 @@ class BatchPredictor:
                 pass  # Silently skip if odds lookup fails
             
         # 4. Generate "The SUPER Trixie" (3 Players x 3 Bets)
-        # Sort by Consistency + Units
-        # We value Consistency MORE for Trixie
-        sorted_res = sorted(results_list, key=lambda x: (x['CONSISTENCY'] * 2) + x['UNITS'], reverse=True)
+        # Sort by BADGE TIER then UNITS then CONSISTENCY
+        # Tier Values: Diamond=4, Gold=3, Standard=2, Lean=1, No Bet=0
+        
+        def get_tier_val(badge):
+            if "DIAMOND" in badge: return 4
+            if "GOLD" in badge: return 3
+            if "STANDARD" in badge: return 2
+            if "LEAN" in badge: return 1
+            return 0
+            
+        sorted_res = sorted(results_list, key=lambda x: (
+            get_tier_val(x['BADGE']), 
+            x['UNITS'], 
+            x['CONSISTENCY']
+        ), reverse=True)
+        
+        # DEBUG: Verify Sort Order
+        print("[Sort Debug] Top 5 Sorted Players:")
+        for i, p in enumerate(sorted_res[:5]):
+             print(f"  {i+1}. {p['PLAYER_NAME']} | {p['BADGE']} | {p['UNITS']}u")
         
         # QUALITY FILTER: Trixie needs STAR POWER (> 15 PPG + High Consistency)
         if len(sorted_res) >= 3:
@@ -729,6 +774,9 @@ class BatchPredictor:
                 'pts': safe_float(p_rows['PTS'].mean()),
                 'reb': safe_float(p_rows['REB'].mean()),
                 'ast': safe_float(p_rows['AST'].mean()),
+                '3pm': safe_float(p_rows['FG3M'].mean()),
+                'blk': safe_float(p_rows['BLK'].mean()),
+                'stl': safe_float(p_rows['STL'].mean()),
                 'pra': safe_float((p_rows['PTS'] + p_rows['REB'] + p_rows['AST']).mean())
             }
          except:
@@ -758,6 +806,9 @@ class BatchPredictor:
                 'avg_pts': safe_float(p_rows['PTS'].mean()),
                 'avg_reb': safe_float(p_rows['REB'].mean()),
                 'avg_ast': safe_float(p_rows['AST'].mean()),
+                'avg_3pm': safe_float(p_rows['FG3M'].mean()),
+                'avg_blk': safe_float(p_rows['BLK'].mean()),
+                'avg_stl': safe_float(p_rows['STL'].mean()),
                 'avg_pra': safe_float(pra_series.mean()),
                 'std_pra': safe_float(pra_series.std()),
                 'games': p_rows['GAME_DATE'].dt.strftime('%Y-%m-%d').tolist(),

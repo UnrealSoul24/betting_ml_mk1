@@ -24,6 +24,7 @@ class RetrainingQueue:
         self.active_jobs = {}  # player_id -> asyncio.Task
         self.completed_jobs = []
         self.failed_jobs = []
+        self.sem = asyncio.Semaphore(1) # Limit to 1 (or 2) concurrent trainings to prevent OOM
     
     async def queue_retraining(self, player_ids: List[int], use_v2: bool = True):
         """
@@ -53,64 +54,71 @@ class RetrainingQueue:
         
         Args:
             player_id: NBA player ID
-            use_v2: Use distributional model
+            use_v2: Use distributional model (Arg kept for compatibility, ignored logic)
         """
-        start_time = datetime.now()
-        print(f"\n[Retrain] Starting training for player {player_id}...")
-        
-        try:
-            # Build command
-            cmd = [
-                PYTHON_EXE,
-                str(PROJECT_ROOT / "src" / "train_models.py"),
-                "--player_id", str(player_id)
-            ]
+        async with self.sem: # Critical: Wait for slot
+            start_time = datetime.now()
+            print(f"\n[Retrain] Starting training for player {player_id}...")
             
-            if use_v2:
-                cmd.append("--v2")
+            try:
+                # Build command
+                cmd = [
+                    PYTHON_EXE,
+                    str(PROJECT_ROOT / "src" / "train_models.py"),
+                    "--player_id", str(player_id)
+                ]
+                
+
+                
+                # Run training subprocess (non-blocking)
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(PROJECT_ROOT)
+                )
+                
+                stdout, stderr = await process.communicate()
+                
+                if process.returncode == 0:
+                    duration = (datetime.now() - start_time).total_seconds()
+                    print(f"[Retrain] ✅ Player {player_id} completed in {duration:.1f}s")
+                    self.completed_jobs.append({
+                        'player_id': player_id,
+                        'timestamp': datetime.now().isoformat(),
+                        'duration_sec': duration,
+                        'success': True
+                    })
+                else:
+                    print(f"[Retrain] ❌ Player {player_id} FAILED")
+                    print(f"  STDOUT: {stdout.decode()[:500]}") # Debug: Show stdout too
+                    print(f"  STDERR: {stderr.decode()[:500]}")
+                    self.failed_jobs.append({
+                        'player_id': player_id,
+                        'timestamp': datetime.now().isoformat(),
+                        'error': (stderr.decode() + "\nSTDOUT: " + stdout.decode())[:1000],
+                        'success': False
+                    })
             
-            # Run training subprocess (non-blocking)
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(PROJECT_ROOT)
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode == 0:
-                duration = (datetime.now() - start_time).total_seconds()
-                print(f"[Retrain] ✅ Player {player_id} completed in {duration:.1f}s")
-                self.completed_jobs.append({
-                    'player_id': player_id,
-                    'timestamp': datetime.now().isoformat(),
-                    'duration_sec': duration,
-                    'success': True
-                })
-            else:
-                print(f"[Retrain] ❌ Player {player_id} FAILED")
-                print(f"  Error: {stderr.decode()[:200]}")
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[Retrain] ❌ Player {player_id} EXCEPTION!")
+                print(f"  Type: {type(e)}")
+                print(f"  Repr: {repr(e)}")
+                print(f"  Trace:\n{tb}")
+                
                 self.failed_jobs.append({
                     'player_id': player_id,
                     'timestamp': datetime.now().isoformat(),
-                    'error': stderr.decode()[:500],
+                    'error': f"{repr(e)}\n{tb}",
                     'success': False
                 })
-        
-        except Exception as e:
-            print(f"[Retrain] ❌ Player {player_id} ERROR: {e}")
-            self.failed_jobs.append({
-                'player_id': player_id,
-                'timestamp': datetime.now().isoformat(),
-                'error': str(e),
-                'success': False
-            })
-        
-        finally:
-            # Remove from active jobs
-            if player_id in self.active_jobs:
-                del self.active_jobs[player_id]
+            
+            finally:
+                # Remove from active jobs
+                if player_id in self.active_jobs:
+                    del self.active_jobs[player_id]
     
     def get_status(self):
         """Returns current queue status."""

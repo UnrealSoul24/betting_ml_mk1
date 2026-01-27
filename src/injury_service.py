@@ -77,7 +77,7 @@ def compare_injury_states(old_state: dict, new_state: dict):
     # Find new injuries
     for player, status in new_injuries.items():
         if player not in old_injuries:
-            if status == "Out":
+            if status == "Out" or "Questionable":
                 changes["new_injuries"].append(player)
                 changes["all_affected"].add(player)
         else:
@@ -114,11 +114,13 @@ def get_injury_report():
     
     try:
         # Use simple requests to get html, then pandas to parse
-        # Adding headers to avoid 403 Forbidden
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.google.com/"
         }
-        r = requests.get(url, headers=headers)
+        r = requests.get(url, headers=headers, timeout=10)
         
         if r.status_code != 200:
             print(f"Failed to fetch injuries. Status: {r.status_code}")
@@ -138,9 +140,34 @@ def get_injury_report():
                     status = str(row['Injury']).strip() # e.g. "Game Time Decision", "Out", "Knee"
                     
                     # Clean up player name (sometimes "Player Name POS")
-                    # CBS format: "LeBron James SF"
-                    # But usually just Name. Let's see.
-                    # Actually CBS is usually "Player Name"
+                    import re
+                    # Cleaning: Handle concatenated "Abbr Fullname" (e.g. "P. GeorgePaul George")
+                    if len(player_name) > 15 and ". " in player_name:
+                         # 1. Regex Match for explicit concatenation pattern
+                         # Matches: Abbr ending in dot/paren + Full Name starting with Capital
+                         match = re.match(r'^([A-Z]\.\s.+?[a-z\.\)])([A-Z].+)$', player_name)
+                         
+                         if match:
+                             group1 = match.group(1)
+                             group2 = match.group(2)
+                             
+                             # Validate Group 2 is a "Clean Name"
+                             # Standard Name: "First Last" or "First Last Suffix"
+                             # Malformed: "HighsmithHaywood" (Internal Caps) or just "Lastname" (No space)
+                             
+                             # Check if Group 2 has space
+                             if " " in group2:
+                                 first_word = group2.split()[0]
+                                 # Ensure first word has no internal caps (ignoring first char)
+                                 # e.g. "Haywood" -> Good. "HighsmithHaywood" -> Bad.
+                                 has_internal_caps = any(c.isupper() for c in first_word[1:])
+                                 if not has_internal_caps:
+                                     player_name = group2
+                         
+                         # 2. Fallback: Search for "Capital Letter" boundary if Regex match failed (or was malformed)
+                         # This handles cases where regex structure might miss edge cases
+                         elif ". " in player_name: 
+                             pass # Rely on regex for now to avoid over-splitting legitimate names like "DeMar"
                     
                     # Normalize Status
                     status_lower = status.lower()

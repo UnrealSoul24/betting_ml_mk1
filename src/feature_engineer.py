@@ -571,7 +571,7 @@ class FeatureEngineer:
         # feature_cols joblib already has the names? 
         # Yes, _fit_artifacts logic below needs to include them in the 'continuous_cols' list.
         # But here we explicitly list non-feature metadata key columns.
-        cols = ['PLAYER_ID', 'PLAYER_IDX', 'TEAM_IDX', 'SEASON_YEAR', 'GAME_DATE', 'PTS', 'REB', 'AST', 'MISSING_PLAYER_IDS']
+        cols = ['PLAYER_ID', 'PLAYER_IDX', 'TEAM_IDX', 'SEASON_YEAR', 'GAME_DATE', 'PTS', 'REB', 'AST', 'FG3M', 'BLK', 'STL', 'MISSING_PLAYER_IDS']
         feature_cols = joblib.load(os.path.join(MODELS_DIR, 'feature_cols.joblib'))
         
         # Ensure all columns exist
