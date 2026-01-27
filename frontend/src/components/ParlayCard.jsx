@@ -1,9 +1,15 @@
 import { motion } from "framer-motion";
-import { Zap, ShieldCheck } from "lucide-react";
+import { Zap, ShieldCheck, Trophy, CheckCircle, Crosshair } from "lucide-react";
 import { clsx } from "clsx";
 
 export default function ParlayCard({ trixie, onLegClick }) {
-    if (!trixie) return null;
+    if (!trixie || !trixie.active) return null;
+
+    // Convert Prob to Percentage
+    const probPct = (trixie.combined_prob * 100).toFixed(1) + "%";
+
+    // Implied Odds (1/p) - purely theoretical
+    const impliedOdds = trixie.combined_prob > 0 ? (1 / trixie.combined_prob).toFixed(2) : "0.00";
 
     return (
         <div className="w-full mb-8">
@@ -19,65 +25,86 @@ export default function ParlayCard({ trixie, onLegClick }) {
                             </div>
                             <div>
                                 <h2 className="text-xl font-bold text-white tracking-tight">THE DAILY TRIXIE</h2>
-                                <p className="text-xs text-gray-400">High Confidence 3-Leg Parlay Strategy</p>
+                                <p className="text-xs text-gray-400">3-Player SGP Strategy (Main Line + Safe Anchors)</p>
                             </div>
                         </div>
+/*
                         <div className="text-right">
-                            <div className="text-xs text-gray-500 uppercase font-mono">Total Odds</div>
+                            <div className="text-xs text-gray-500 uppercase font-mono">Combined Prob</div>
                             <div className="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-neon-purple to-white">
-                                {trixie.total_odds.toFixed(2)}x
+                                {probPct}
                             </div>
                         </div>
+                        */
                     </div>
 
-                    {/* Legs */}
+                    {/* Legs (Groups) */}
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                        {trixie.sgp_legs.map((leg, i) => (
+                        {trixie.legs.map((leg, i) => (
                             <div
                                 key={i}
-                                onClick={() => onLegClick && onLegClick(leg)}
-                                className="bg-white/5 border border-white/5 rounded-xl p-4 flex flex-col h-full bg-gradient-to-b from-white/5 to-transparent cursor-pointer hover:bg-white/10 transition-colors group"
+                                onClick={() => onLegClick && onLegClick({ ...leg, player_name: leg.player })}
+                                className="bg-white/5 border border-white/5 rounded-xl p-4 flex flex-col h-full bg-gradient-to-b from-white/5 to-transparent cursor-pointer hover:bg-white/10 transition-colors group relative overflow-hidden"
                             >
-                                {/* Player Header */}
-                                <div className="border-b border-white/10 pb-3 mb-3">
-                                    <div className="flex justify-between items-center mb-1">
-                                        <span className="text-[10px] font-bold text-neon-purple px-2 py-0.5 rounded bg-neon-purple/10">SGP Leg #{i + 1}</span>
-                                        <span className="text-[10px] font-mono text-gray-500">{leg.matchup}</span>
-                                    </div>
-                                    <h3 className="font-bold text-white text-lg truncate group-hover:text-neon-purple transition-colors">{leg.player_name}</h3>
+                                <div className="absolute top-0 right-0 p-2 opacity-50 text-6xl font-black text-white/5 select-none pointer-events-none">
+                                    {String.fromCharCode(65 + i)}
                                 </div>
 
-                                {/* 3 Bets */}
+                                {/* Header */}
+                                <div className="mb-4 pb-3 border-b border-white/10">
+                                    <div className="flex justify-between items-center mb-1">
+                                        <span className="text-[10px] font-bold text-neon-purple px-2 py-0.5 rounded bg-neon-purple/10">Group {String.fromCharCode(65 + i)}</span>
+                                        <span className={clsx(
+                                            "text-[10px]",
+                                            leg.badge.includes("DIAMOND") ? "text-cyan-400" :
+                                                leg.badge.includes("GOLD") ? "text-yellow-400" : "text-gray-500"
+                                        )}>{leg.badge}</span>
+                                    </div>
+                                    <h3 className="font-bold text-white text-lg truncate group-hover:text-neon-purple transition-colors">{leg.player}</h3>
+                                </div>
+
+                                {/* Bets List */}
                                 <div className="space-y-2 flex-grow">
                                     {leg.bets.map((bet, j) => (
                                         <div key={j} className={clsx(
                                             "flex justify-between items-center p-2 rounded text-sm border",
-                                            bet.type === 'MAIN' ? "bg-neon-green/10 border-neon-green/30" : "bg-black/20 border-white/5"
+                                            bet.type === 'MAIN' ? "bg-neon-green/10 border-neon-green/30" : "bg-black/20 border-white/5 opacity-80"
                                         )}>
-                                            <span className={clsx(
-                                                "font-bold",
-                                                bet.type === 'MAIN' ? "text-neon-green" : "text-gray-300"
-                                            )}>{bet.desc}</span>
+                                            <div className="flex items-center gap-2">
+                                                {bet.type === 'MAIN' ? (
+                                                    <Crosshair size={14} className="text-neon-green" />
+                                                ) : (
+                                                    <CheckCircle size={14} className="text-gray-500" />
+                                                )}
+                                                <span className={clsx(
+                                                    "font-bold font-mono",
+                                                    bet.type === 'MAIN' ? "text-neon-green" : "text-gray-300"
+                                                )}>{bet.desc}</span>
+                                            </div>
 
                                             {bet.type === 'MAIN' ? (
-                                                <ShieldCheck size={14} className="text-neon-green" />
+                                                <span className="text-[10px] text-neon-green uppercase font-bold tracking-wider">Main</span>
                                             ) : (
-                                                <span className="text-[10px] text-gray-500 uppercase">Safe Anchor</span>
+                                                <span className="text-[10px] text-gray-500 uppercase">Safe</span>
                                             )}
                                         </div>
                                     ))}
+
+                                    {leg.bets.length === 0 && (
+                                        <div className="text-xs text-gray-500 italic p-2">No valid props found.</div>
+                                    )}
                                 </div>
 
-                                <div className="mt-3 pt-2 border-t border-white/5 text-center">
-                                    <span className="text-[10px] text-gray-400">Total SGP Odds</span>
-                                    <div className="text-white font-mono font-bold">{leg.sgp_odds?.toFixed(2) || "-"}x</div>
+                                <div className="w-full mt-4 pt-3 border-t border-white/5 flex justify-between items-center text-xs">
+                                    <span className="text-gray-500">Unit Size</span>
+                                    <span className="text-white font-mono font-bold">{leg.units}u</span>
                                 </div>
                             </div>
                         ))}
                     </div>
 
                     <div className="mt-4 text-center text-xs text-gray-500">
-                        Recommended: <span className="text-white font-bold">{trixie.rec_units} Units</span> on the full Parlay.
+                        Top 3 Daily Plays optimized for SGP connectivity.
                     </div>
                 </div>
             </div>

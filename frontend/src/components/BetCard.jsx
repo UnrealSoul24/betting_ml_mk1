@@ -76,6 +76,34 @@ export default function BetCard({ pred, onClick, index }) {
                     </div>
                 </div>
             </div>
+            {/* AI Trixie Section */}
+            {pred.SGP_ACTIVE && pred.TRIXIE_LEGS && pred.TRIXIE_LEGS.length > 0 && (
+                <div className="mt-4 pt-3 border-t border-white/10 bg-gradient-to-r from-purple-500/10 to-blue-500/10 -mx-5 -mb-5 px-5 py-3">
+                    <div className="flex justify-between items-center mb-2">
+                        <div className="flex items-center gap-1.5">
+                            <span className="text-sm">🤖</span>
+                            <span className="text-[10px] font-bold text-neon-purple uppercase tracking-wider">AI Generated Trixie</span>
+                        </div>
+                        <div className="text-xs font-mono font-bold text-white">
+                            {(pred.SGP_PROB * 100).toFixed(1)}% <span className="text-gray-500 text-[10px] font-normal">PROB</span>
+                        </div>
+                    </div>
+                    <div className="space-y-1">
+                        {pred.TRIXIE_LEGS.map((leg, i) => (
+                            <div key={i} className="flex justify-between items-center text-xs">
+                                <span className="text-gray-400 font-medium w-8">{leg.stat}</span>
+                                <div className="flex-1 h-px bg-white/5 mx-2"></div>
+                                <span className={clsx(
+                                    "font-bold font-mono",
+                                    i === 0 ? "text-neon-green" : "text-white"
+                                )}>
+                                    {leg.line.toFixed(1)}+
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
         </motion.div>
     );
 }

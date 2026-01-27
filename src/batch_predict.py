@@ -7,6 +7,7 @@ from datetime import datetime
 from src.data_fetch import fetch_daily_scoreboard
 from src.feature_engineer import FeatureEngineer
 from src.train_models import NBAPredictor
+from src.sgp_model import SGPMetaModel
 from src.odds_service import fetch_nba_odds, get_ev_for_prediction, get_game_total_for_matchup
 from nba_api.stats.static import teams
 import asyncio
@@ -28,6 +29,23 @@ class BatchPredictor:
         self.resources['t_enc'] = joblib.load(os.path.join(MODELS_DIR, 'team_encoder.joblib'))
         self.resources['scaler'] = joblib.load(os.path.join(MODELS_DIR, 'scaler.joblib'))
         self.resources['feature_cols'] = joblib.load(os.path.join(MODELS_DIR, 'feature_cols.joblib'))
+        
+        # Load SGP Meta Model
+        try:
+            sgp_path = os.path.join(MODELS_DIR, 'sgp_meta_model.pth')
+            scaler_path = os.path.join(MODELS_DIR, 'sgp_scaler.joblib')
+            if os.path.exists(sgp_path) and os.path.exists(scaler_path):
+                self.sgp_model = SGPMetaModel(input_dim=12).to(device) # 12 Features (6 Preds + 6 Stds)
+                self.sgp_model.load_state_dict(torch.load(sgp_path, map_location=device))
+                self.sgp_model.eval()
+                self.sgp_scaler = joblib.load(scaler_path)
+                self.sgp_loaded = True
+                print("SGP Meta Model Loaded.")
+            else:
+                self.sgp_loaded = False
+        except Exception as e:
+            print(f"Failed to load SGP Model: {e}")
+            self.sgp_loaded = False
         
     def _get_model(self, player_id: int):
         # Determine model path
@@ -538,6 +556,70 @@ class BatchPredictor:
             # Get Season Stats (Already calculated above)
             # season_stats = self._get_season_stats(pid, df_history)
 
+            # ---- SGP META MODEL INFERENCE ----
+            sgp_info = {'active': False, 'prob': 0.0, 'legs': []}
+            if self.sgp_loaded:
+                try:
+                    # Construct Input Vector (12 dims): [PTS_PRED, PTS_STD, REB_PRED, ...]
+                    # Order must match training: PTS, REB, AST, 3PM, BLK, STL
+                    sgp_feats = [
+                        pred_pts, std_pts,
+                        pred_reb, std_reb,
+                        pred_ast, std_ast,
+                        pred_3pm, std_3pm,
+                        pred_blk, std_blk,
+                        pred_stl, std_stl
+                    ]
+                    sgp_tensor = torch.FloatTensor([sgp_feats]).to(device)
+                    # Scale (Manual transform using joblib scaler)
+                    # Sklearn scaler expects (N, 12).
+                    # Need to perform transform on CPU or replicate scaler logic?
+                    # Faster to just use scaler.transform
+                    scaled_feats = self.sgp_scaler.transform([sgp_feats])
+                    scaled_tensor = torch.FloatTensor(scaled_feats).to(device)
+                    
+                    with torch.no_grad():
+                        sgp_out = self.sgp_model(scaled_tensor)
+                        sgp_probs = torch.sigmoid(sgp_out).cpu().numpy()[0] # [6]
+                    
+                    # Map back to names
+                    stat_names = ['PTS', 'REB', 'AST', '3PM', 'BLK', 'STL']
+                    
+                    # Create List of (Name, Prob, SafeVal)
+                    legs = []
+                    for i, name in enumerate(stat_names):
+                        # Calculate Safe Line (Same as training)
+                        margin = 2.0 if name == 'PTS' else 1.0
+                        pred_val = sgp_feats[i*2]
+                        safe_line = max(0.5, pred_val - margin) # Ensure at least 0.5?
+                        legs.append({
+                            'stat': name,
+                            'prob': float(sgp_probs[i]),
+                            'line': safe_line
+                        })
+                        
+                    # Select Top 3 for Trixie
+                    # User Logic: Model chooses "Main" + 2 "Safe".
+                    # We sort by Probability descending.
+                    legs.sort(key=lambda x: x['prob'], reverse=True)
+                    top_3 = legs[:3]
+                    
+                    # Combined Probability (Naive Independence assumption, but model trained on individual hits)
+                    # Actually Meta Model output is individual hit probability.
+                    # We approximate Joint Prob = P1 * P2 * P3
+                    combined_prob = top_3[0]['prob'] * top_3[1]['prob'] * top_3[2]['prob']
+                    
+                    sgp_info = {
+                        'active': True,
+                        'prob': combined_prob,
+                        'legs': top_3,
+                        'all_legs': legs
+                    }
+                except Exception as e:
+                    print(f"SGP Inference Error: {e}")
+            
+            # ----------------------------------
+
             res = {
                 'PLAYER_ID': int(pid),
                 'PLAYER_NAME': str(pname),
@@ -595,6 +677,12 @@ class BatchPredictor:
                 'MARKET_ODDS': None,
                 'EV': None,
                 'EV_RECOMMENDATION': None,
+
+                # SGP / Trixie Info
+                'SGP_PROB': float(sgp_info['prob']),
+                'TRIXIE_LEGS': sgp_info['legs'] if sgp_info['active'] else [],
+                'SGP_LEGS': sgp_info.get('all_legs', []) if sgp_info['active'] else [],
+                'SGP_ACTIVE': sgp_info['active']
             }
             results_list.append(res)
         
@@ -641,120 +729,107 @@ class BatchPredictor:
         for i, p in enumerate(sorted_res[:5]):
              print(f"  {i+1}. {p['PLAYER_NAME']} | {p['BADGE']} | {p['UNITS']}u")
         
-        # QUALITY FILTER: Trixie needs STAR POWER (> 15 PPG + High Consistency)
-        if len(sorted_res) >= 3:
+        # 4. Generate "Daily Trixie" (Top 3 Players by SGP Confidence)
+        trixie = None
+        if len(results_list) >= 3:
+            # DEBUG
+            try:
+                debug_pts = [p.get('SEASON_PTS') for p in results_list[:5]]
+                print(f"[TRIXIE DEBUG] Count: {len(results_list)}. Sample PTS: {debug_pts}")
+            except: pass
+
+            # Helper to score badges
+            def get_badge_score(p):
+                b = p.get('BADGE', '')
+                if 'DIAMOND' in b: return 3
+                if 'GOLD' in b: return 2
+                if 'SILVER' in b: return 1
+                return 0
+
+            # Filter for Volume first (Trixie Strategy requires reliable stars)
+            candidates = [p for p in results_list if p.get('SEASON_PTS', 0) >= 12.0]
+            if len(candidates) < 3:
+                candidates = results_list # Fallback
+            
+            # Sort by Badge Score desc, then SGP Prob desc (Prioritize Diamond/Gold)
+            trixie_candidates = sorted(candidates, key=lambda x: (get_badge_score(x), x.get('SGP_PROB', 0.0)), reverse=True)
+            top_3 = trixie_candidates[:3]
+            
             legs = []
+            combined_prob = 1.0
             
-            # Iterate through all candidates until we have 3 valid legs
-            # Start with stars, then everyone else
-            prioritized_candidates = [p for p in sorted_res if p.get('SEASON_PTS', 0) > 15.0]
-            rest_candidates = [p for p in sorted_res if p.get('SEASON_PTS', 0) <= 15.0]
-            
-            for p in prioritized_candidates + rest_candidates:
-                if len(legs) >= 3:
-                    break
-                    
-                from src.odds_service import get_player_prop_odds
-                
+            for p in top_3:
                 player_bets = []
                 
-                # Check all 3 props for this player
-                for stat in ['PTS', 'REB', 'AST']:
-                    pred_key = f'PRED_{stat}'
-                    pred = p.get(pred_key, 0)
-                    
-                    # Get REAL market line from API
-                    prop_odds = get_player_prop_odds(p['PLAYER_NAME'], stat, odds_data)
-                    
-                    if not prop_odds.get('found'):
-                        continue  # Skip if no market data
-                    
-                    market_line = prop_odds['line']
-                    odds_over = prop_odds['odds_over']
-                    odds_under = prop_odds['odds_under']
-                    
-                    # Calculate edge
-                    edge = pred - market_line
-                    
-                    # Relaxed threshold to ensure we find 3 legs
-                    min_edge = 0.1
-                    
-                    if edge >= min_edge:
-                        # Bet OVER - our prediction exceeds the line
-                        player_bets.append({
-                            'type': 'MAIN' if stat == p.get('BEST_PROP') else 'ANCHOR',
-                            'prop': stat,
-                            'direction': 'OVER',
-                            'target': market_line,
-                            'prediction': pred,
-                            'edge': round(edge, 1),
-                            'desc': f"{stat} O{market_line:.1f}",
-                            'odds': odds_over,
-                            'source': 'market'
-                        })
-                    elif edge <= -min_edge:
-                        # Bet UNDER - our prediction is below the line
-                        player_bets.append({
-                            'type': 'ANCHOR',
-                            'prop': stat,
-                            'direction': 'UNDER',
-                            'target': market_line,
-                            'prediction': pred,
-                            'edge': round(abs(edge), 1),
-                            'desc': f"{stat} U{market_line:.1f}",
-                            'odds': odds_under,
-                            'source': 'market'
-                        })
+                # 1. Main Bet (Best Prop)
+                main_prop = p['BEST_PROP']
+                # Format Main Bet Description
+                main_desc = f"{p['BEST_PROP']} {p['BEST_VAL']:.1f}"
                 
-                # Enforce strict structure: 1 MAIN + 2 ANCHORS
-                main_bets = [b for b in player_bets if b['type'] == 'MAIN']
-                anchor_bets = [b for b in player_bets if b['type'] == 'ANCHOR']
+                player_bets.append({
+                    'type': 'MAIN',
+                    'prop': main_prop,
+                    'val': p['BEST_VAL'],
+                    'desc': main_desc,
+                    'prob': 0.55 # Implicit
+                })
                 
-                # Sort anchors by edge to get the safest/best ones
-                anchor_bets.sort(key=lambda x: x['edge'], reverse=True)
+                # 2. Safe Anchors (From SGP Meta Model)
+                potential_anchors = p.get('SGP_LEGS', [])
+                # Ensure sorted by prob
+                potential_anchors.sort(key=lambda x: x['prob'], reverse=True)
                 
-                selected_bets = []
-                if main_bets and len(anchor_bets) >= 2:
-                    # Satisfies the "Trixie Maker" requirement
-                    selected_bets = [main_bets[0]] + anchor_bets[:2]
-                else:
-                    # Strict rule: if we can't make the perfect 3-leg SGP, skip this player
-                    selected_bets = []
-                
-                if selected_bets:  # Only add player if they have bettable props
-                    from src.odds_service import american_to_decimal
+                anchors_added = 0
+                for anc in potential_anchors:
+                    if anchors_added >= 2: break
                     
-                    # Calculate SGP Odds for this player
-                    sgp_odds = 1.0
-                    for bet in selected_bets:
-                        if bet['type'] == 'MAIN':
-                            # Use REAL odds for the main line
-                            real_decimal = american_to_decimal(bet.get('odds', '-110'))
-                            sgp_odds *= real_decimal
-                        else:
-                            # Use ESTIMATE for safe anchors (since we don't have alt line odds in cache)
-                            sgp_odds *= 1.35  # Safe anchor ~1.35x (-280ish)
+                    stat = anc['stat']
+                    prob = anc['prob']
+                    line = anc['line']
                     
-                    legs.append({
-                        **p, # Include full stats for Modal
-                        'player_name': p['PLAYER_NAME'],
-                        'matchup': p['MATCHUP'],
-                        'bets': selected_bets,
-                        'sgp_odds': round(sgp_odds, 2)
-                    })
+                    # Skip if same as main prop
+                    if stat == main_prop: continue
+                    
+                    # Filter Trivia
+                    # User: "Lowest at 1". So we accept line >= 1.5 (which means betting Over 1.5 -> 2+)
+                    # For PTS, we want at least a bucket or two (Over 3.5 -> 4+)
+                    min_threshold = 3.5 if stat == 'PTS' else 1.5
+                    
+                    if line < min_threshold: continue
 
-            # Calculate Total Trixie Odds (Product of all SGPs)
-            total_trixie_odds = 1.0
-            for leg in legs:
-                total_trixie_odds *= leg['sgp_odds']
+                    # Re-added Probability Floor (User: "25% confident is weird")
+                    if prob < 0.55: continue
+                    
+                    # RELAXED: Removed 0.75 probability gate to ensure we populate the card.
+                    # We rely on sorting by prob to get the best available.
+                    
+                    player_bets.append({
+                        'type': 'SAFE',
+                        'prop': stat,
+                        'val': line,
+                        'desc': f"{stat} {line:.1f}+",
+                        'prob': prob
+                    })
+                    anchors_added += 1
+                
+                legs.append({
+                    **p, # Include full stats for Modal
+                    'player': p['PLAYER_NAME'],
+                    'badge': p['BADGE'],
+                    'units': p['UNITS'],
+                    'bets': player_bets,
+                    'sgp_prob': p.get('SGP_PROB', 0.5)
+                })
+                
+                combined_prob *= p.get('SGP_PROB', 0.5)
             
             trixie = {
-                'sgp_legs': legs,
-                'total_odds': round(total_trixie_odds, 2),
-                'rec_units': 0.1, # Suggest small unit size for high odds (Trixie/Parlay)
-                'potential_return': round(total_trixie_odds * 0.1, 2)
+                'active': True,
+                'combined_prob': combined_prob,
+                'legs': legs,
+                'title': "DAILY AI TRIXIE"
             }
-            
+
         return {'predictions': sorted_res, 'trixie': trixie}
 
     def _get_season_stats(self, pid, df_history):
