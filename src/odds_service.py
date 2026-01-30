@@ -32,7 +32,11 @@ STAT_MAP = {
     'AST': 'assists',
     'STL': 'steals',
     'BLK': 'blocks',
-    '3PM': 'threesMade'
+    '3PM': 'threesMade',
+    'RA': 'rebounds-assists',
+    'PR': 'points-rebounds',
+    'PA': 'points-assists',
+    'PRA': 'points-rebounds-assists'
 }
 
 def _get_cache_path():
@@ -255,15 +259,21 @@ def get_player_prop_odds(player_name: str, stat_type: str = 'PTS', odds_data=Non
         'player_api_id': player_api_id
     }
 
-def get_ev_for_prediction(player_name: str, stat_type: str, prediction: float, model_confidence: float = 0.6, odds_data=None):
+def normal_cdf(x, mu=0, sigma=1):
+    """Cumulative Distribution Function for Normal Distribution."""
+    import math
+    return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
+
+def get_ev_for_prediction(player_name: str, stat_type: str, prediction: float, std_dev: float = None, model_confidence: float = None, odds_data=None):
     """
     Calculates Expected Value for a prediction vs market odds.
     
     Args:
         player_name: e.g., "Joel Embiid"
-        stat_type: 'PTS', 'REB', or 'AST'
+        stat_type: 'PTS', 'REB', ...
         prediction: Model's predicted value (e.g., 28.5 points)
-        model_confidence: How confident we are in the model (0-1)
+        std_dev: Model's uncertainty (Standard Deviation). Preferred over model_confidence.
+        model_confidence: Deprecated/Fallback (0-1).
         odds_data: Optional pre-fetched odds
     
     Returns:
@@ -276,23 +286,27 @@ def get_ev_for_prediction(player_name: str, stat_type: str, prediction: float, m
     
     line = prop['line']
     
-    # Estimate probability of going over based on prediction vs line
-    # Simple model: If prediction is X points above line, P(over) increases
-    edge = prediction - line
-    
-    # Rough probability estimation:
-    # If prediction == line, P = 0.5
-    # Each point above/below shifts probability
-    # Using a sigmoid-like approximation
-    import math
-    p_over = 1 / (1 + math.exp(-edge * 0.3))  # Steepness factor of 0.3
-    
-    # Adjust by model confidence
-    p_over_adjusted = 0.5 + (p_over - 0.5) * model_confidence
+    # Calculate Probability of Over
+    if std_dev and std_dev > 0:
+        # Gaussian method (Robust)
+        # P(Over) = 1 - CDF(line)
+        # We use line implies > line. 
+        # But strictly Over 25.5 means 26+. Continuous CDF at 25.5 is correct.
+        p_over = 1 - normal_cdf(line, mu=prediction, sigma=std_dev)
+    else:
+        # Fallback Sigmoid Logic (if only model_confidence provided)
+        # Assuming std_dev proxy of ~15% of prediction if missing
+        sigma_proxy = prediction * 0.15 if prediction > 0 else 1.0
+        p_over = 1 - normal_cdf(line, mu=prediction, sigma=sigma_proxy)
+        
+        # Adjust using the old confidence scalar if provided
+        if model_confidence:
+             p_over = 0.5 + (p_over - 0.5) * model_confidence
     
     # Calculate EV
-    ev_over = calculate_ev(p_over_adjusted, prop['odds_over'])
-    ev_under = calculate_ev(1 - p_over_adjusted, prop['odds_under'])
+    ev_over = calculate_ev(p_over, prop['odds_over'])
+    p_under = 1 - p_over
+    ev_under = calculate_ev(p_under, prop['odds_under'])
     
     return {
         'found': True,
@@ -300,8 +314,9 @@ def get_ev_for_prediction(player_name: str, stat_type: str, prediction: float, m
         'stat': stat_type,
         'prediction': prediction,
         'market_line': line,
-        'edge': edge,
-        'p_over': p_over_adjusted,
+        'std_dev': std_dev,
+        'p_over': p_over,
+        'p_under': p_under,
         'ev_over': ev_over,
         'ev_under': ev_under,
         'odds_over': prop['odds_over'],

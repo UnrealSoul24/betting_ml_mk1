@@ -202,11 +202,11 @@ export default function PlayerDetailModal({ isOpen, onClose, player }) {
                         <div className="bg-[#0f0f13] border border-white/10 rounded-xl overflow-hidden mb-8 shadow-2xl">
                             <div className="grid grid-cols-6 gap-0 text-center bg-white/5 text-[10px] text-gray-400 uppercase font-bold py-3 border-b border-white/5">
                                 <div className="text-left pl-6">Stat</div>
-                                <div>Season</div>
-                                <div>L5</div>
+                                <div>Season / L5</div>
                                 <div>Pred ± Std</div>
-                                <div>68% Range</div>
-                                <div>Safe Line</div>
+                                <div>Market Line</div>
+                                <div>Win Prob</div>
+                                <div>EV</div>
                             </div>
 
                             {['PTS', 'REB', 'AST', '3PM', 'BLK', 'STL'].map(stat => {
@@ -223,8 +223,13 @@ export default function PlayerDetailModal({ isOpen, onClose, player }) {
 
                                 const proj = player[`PRED_${stat}`] || 0;
                                 const mae = player[`MAE_${stat}`] || 0;
-                                const safe = player[`LINE_${stat}_LOW`] || 0;
-                                const high = player[`LINE_${stat}_HIGH`] || 0;
+
+                                // Get Analysis Data
+                                const analysis = player.PROPS_ANALYSIS?.[stat] || {};
+                                const marketLine = analysis.market_line;
+                                const marketOdds = analysis.odds_over;
+                                const winProb = analysis.p_over;
+                                const ev = analysis.ev_over;
 
                                 const isHeating = l5 > sea * 1.05;
                                 const isCooling = l5 < sea * 0.95;
@@ -233,15 +238,14 @@ export default function PlayerDetailModal({ isOpen, onClose, player }) {
                                     <div key={stat} className="grid grid-cols-6 gap-0 text-center border-b border-white/5 py-4 hover:bg-white/5 transition-all group items-center">
                                         <div className="text-left pl-6 font-bold text-gray-300 text-sm">{stat}</div>
 
-                                        <div className="text-gray-500 font-mono text-sm">{sea.toFixed(1)}</div>
-
-                                        <div className={clsx(
-                                            "font-mono font-bold text-sm",
-                                            isHeating ? "text-neon-green" : isCooling ? "text-blue-400" : "text-gray-300"
-                                        )}>
-                                            {l5?.toFixed(1) || "-"}
-                                            {isHeating && <TrendingUp size={12} className="inline ml-1 mb-0.5" />}
-                                            {isCooling && <TrendingDown size={12} className="inline ml-1 mb-0.5" />}
+                                        <div className="flex flex-col justify-center items-center">
+                                            <div className="text-gray-500 font-mono text-xs">{sea.toFixed(1)}</div>
+                                            <div className={clsx(
+                                                "font-mono font-bold text-xs",
+                                                isHeating ? "text-neon-green" : isCooling ? "text-blue-400" : "text-gray-400"
+                                            )}>
+                                                {l5?.toFixed(1) || "-"}
+                                            </div>
                                         </div>
 
                                         <div className="text-white font-mono">
@@ -251,12 +255,35 @@ export default function PlayerDetailModal({ isOpen, onClose, player }) {
                                             )}
                                         </div>
 
-                                        <div className="text-gray-400 font-mono text-xs">
-                                            {safe.toFixed(1)} - {high.toFixed(1)}
+                                        <div className="flex flex-col justify-center items-center">
+                                            {marketLine ? (
+                                                <>
+                                                    <span className="text-white font-bold text-sm">{marketLine}</span>
+                                                    <span className="text-[10px] text-gray-500">{marketOdds}</span>
+                                                </>
+                                            ) : (
+                                                <span className="text-gray-600 text-xs">-</span>
+                                            )}
                                         </div>
 
-                                        <div className="text-neon-green font-mono font-bold text-sm">
-                                            &gt; {safe?.toFixed(1)}
+                                        <div className="text-gray-300 font-mono text-sm font-bold">
+                                            {winProb ? (
+                                                <span className={winProb > 60 ? "text-neon-green" : winProb > 55 ? "text-white" : "text-gray-500"}>
+                                                    {winProb}%
+                                                </span>
+                                            ) : "-"}
+                                        </div>
+
+                                        <div className="font-mono font-bold text-sm">
+                                            {ev !== undefined ? (
+                                                <span className={
+                                                    ev > 5 ? "text-neon-green" :
+                                                        ev > 0 ? "text-white" :
+                                                            "text-red-400"
+                                                }>
+                                                    {ev > 0 ? '+' : ''}{ev}%
+                                                </span>
+                                            ) : "-"}
                                         </div>
                                     </div>
                                 );

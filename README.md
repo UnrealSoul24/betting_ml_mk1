@@ -42,6 +42,7 @@ A professional-grade Machine Learning system for predicting NBA player stats (Po
 The easiest way to use the system is via the Web Dashboard.
 
 ```bash
+cd .\betting_ml_mk1\
 uvicorn src.api:app --reload
 ```
 - API runs at: `http://localhost:8000`
@@ -51,7 +52,7 @@ uvicorn src.api:app --reload
 If you have the React frontend set up (in `/frontend`):
 
 ```bash
-cd frontend
+cd .\betting_ml_mk1\frontend
 npm run dev
 ```
 - Dashboard: `http://localhost:5173`

@@ -103,6 +103,10 @@ class BatchPredictor:
         """
         target_date = date_input if date_input else datetime.now().strftime('%Y-%m-%d')
         
+        print("ANTIGRAVITY DEBUG: analyze_today_batch STARTED. Code Version: RELOADED") # DEBUG
+        # Initialize result variables early
+        trixie = None
+        
         if log_manager: await log_manager.broadcast("Loading historical data from disk...")
         
         # 1. Load All Data (Heavy IO - done once)
@@ -354,178 +358,44 @@ class BatchPredictor:
 
             # 2. Get Last 5 Games Context
             last_5 = self._get_last_5(pid, df_history, target_dt)
-
-            # 3. Calculate Betting Lines & Units
-            # We don't have real lines, so we simulate "Implied Lines" based on predictions
-            # The "Buy" line is Pred - MAE (Consumer safety)
-            # The "Sell" line is Pred + MAE
             
-            # We calculate "Confidence Score" for the implied bet.
-            # Since we define the line ourselves here as the "Safe Zone", 
-            # We can treat the "Edge" as the gap we are giving.
-            
-            # Let's Standardize Unit Recommender based on "Projection Stability" (Low MAE = High Conf)
-            # And "Recent Form" (If Trend aligns with Pred -> Boost)
-            
-            # Get Season Stats (Move UP for filtering)
+            # Get Season Stats
             season_stats = self._get_season_stats(pid, df_history)
             season_pts = season_stats.get('pts', 0.0)
-            
-            # --- QUALITY CONTROL ---
-            # 1. Clip Negatives
-            pred_pts = max(0.0, float(pred_pts))
-            pred_reb = max(0.0, float(pred_reb))
-            pred_ast = max(0.0, float(pred_ast))
-            pred_3pm = max(0.0, float(pred_3pm))
-            pred_blk = max(0.0, float(pred_blk))
-            pred_stl = max(0.0, float(pred_stl))
-            pred_pra = pred_pts + pred_reb + pred_ast
-            
-            # 2. Relevance Filter (Restore Strict Filter per User Request)
-            if season_pts < 8.0 and pred_pts < 10.0:
-                 continue
-            # if season_pts < 1.0 and pred_pts < 1.0: # Only skip absolute zeros
-            #      continue
 
-            valid_bets = []
-            
-            # Analyze Main Props
+            # 3. Calculate Betting Lines & Units
+            from src.bet_sizing import calculate_bet_quality
+
             props = [
-                ('PTS', pred_pts, mae_pts, last_5.get('avg_pts', 0)),
-                ('REB', pred_reb, mae_reb, last_5.get('avg_reb', 0)),
-                ('AST', pred_ast, mae_ast, last_5.get('avg_ast', 0)),
-                ('PRA', pred_pra, mae_pra, last_5.get('avg_pra', 0)),
-                ('3PM', pred_3pm, mae_3pm, 0), # No last 5 data yet for these
-                ('BLK', pred_blk, mae_blk, 0),
-                ('STL', pred_stl, mae_stl, 0)
+                ('PTS', pred_pts, mae_pts, pred_pts),
+                ('REB', pred_reb, mae_reb, pred_reb), # val placeholder
+                ('AST', pred_ast, mae_ast, pred_ast),
+                ('PRA', pred_pra, mae_pra, pred_pra),
+                ('RA', pred_ra, mae_reb + mae_ast, pred_ra), 
+                ('PR', pred_pr, mae_pts + mae_reb, pred_pr),
+                ('PA', pred_pa, mae_pts + mae_ast, pred_pa),
+                ('3PM', pred_3pm, mae_3pm, pred_3pm),
+                ('BLK', pred_blk, mae_blk, pred_blk),
+                ('STL', pred_stl, mae_stl, pred_stl)
             ]
-            
-            # Smart Unit Logic
-            # Base Unit = 1.0
-            # Multipliers:
-            # - Low Variance (MAE < X% of Pred): x1.2
-            # - Recent Form Match (Last 5 avg is close to Pred): x1.2
-            # - Inconsistency (Last 5 std dev high): x0.8
             
             best_prop = None
             highest_score = -1
             
-            for p_name, val, mae, recent in props:
-                # Simple Heuristic score for "Bet Quality"
-                # We want High Val relative to MAE (Signal to Noise)
-                # But mostly we want STABILITY.
+            for p_name, val, mae, _ in props: # _ was val repeat
+                # Calculate quality
+                # Safe Line: For display in grid.
+                calc = calculate_bet_quality(p_name, val, mae, val, last_5)
                 
-                # Check for "Edge" relative to a hypothetical bookmaker line.
-                # Since we don't have lines, we can't calculate true Edge.
-                # We will output the "Safe Line" to bet vs.
-                
-                # Confidence Calculation
-                # Z-Score equivalent: How many MAEs away from 0 is the prediction? 
-                # (Not really relevant for Over/Under unless we have a line)
-                # Let's use Inverse CV (Coefficient of Variation) = Mean / StdDev(MAE)
-                # Higher is better.
-                if val < 0.1: continue
-                cv_score = val / (mae + 0.1) 
-                
-                # Unit Calc - UPDATED FOR CONSISTENCY
-                # We want CONSISTENT players.
-                # Measure: CV (StdDev / Mean) of Last 5 Games.
-                # If CV is low (< 0.2), they are very consistent.
-                
-                std_dev = last_5.get('std_pra', 10.0) # Default high variance
-                avg_l5 = last_5.get('avg_pra', 1.0)
-                
-                # Consistency Factor (Inverse of Variance)
-                # 0.0 - 1.0 score (1.0 = Rock Solid)
-                consistency_score = 1.0
-                if avg_l5 > 0:
-                     cv_val = std_dev / avg_l5
-                     # Map CV 0.1 -> 1.0, CV 0.5 -> 0.0
-                     consistency_score = max(0.0, 1.0 - (cv_val * 2))
-                
-                # --- SCIENTIFIC UNIT SIZING (KELLY CRITERION) ---
-                # We replace heuristics with probability theory.
-                
-                # 1. Estimate Win Probability (P)
-                # Base rate for NFL/NBA props is roughly 53-54% for breakeven.
-                # We start at 51% (Conservative)
-                base_prob = 0.51
-                
-                # Boosts
-                consistency_boost = consistency_score * 0.15 # Up to +15% for rock solid players
-                model_boost = min(0.08, cv_score / 50.0)    # Up to +8% for huge model edges
-                
-                # Penalty for High Variance (already in consistency, but let's be safe)
-                if std_dev > avg_l5 * 0.3:
-                    consistency_boost *= 0.5
-                
-                win_prob = base_prob + consistency_boost + model_boost
-                
-                # Cap prob at 70% (realistic ceiling for sports models)
-                win_prob = min(0.70, win_prob)
-                
-                # 2. Apply Kelly Criterion
-                # f = (bp - q) / b
-                # b = odds - 1 (Assuming standard -110 lines => decimal 1.91 => b = 0.91)
-                b = 0.91
-                q = 1 - win_prob
-                
-                f_star = ((b * win_prob) - q) / b
-                
-                # 3. Fractional Kelly (Safety)
-                # Eighth Kelly (Very Safe) because our P estimate is noisy.
-                kelly_fraction = 0.125 
-                recommended_bankroll_pct = max(0.0, f_star * kelly_fraction)
-                
-                # Convert to "Units" (Assuming 1 Unit = 1% of Bankroll)
-                # If Kelly says bet 1% of bankroll, that is 1.0 Units.
-                raw_units = recommended_bankroll_pct * 100.0
-                
-                # 4. Badging & Caps & STABILITY GATES
-                units = round(raw_units * 4) / 4 # Round to nearest 0.25
-                
-                # --- CONSISTENCY GATES ---
-                # You cannot be Diamond if you are erratic (D grade).
-                if consistency_score < 0.4:
-                    units = min(units, 0.25) # Max LEAN for D-Grade
-                elif consistency_score < 0.6:
-                    units = min(units, 0.50) # Max STANDARD for C-Grade
-                elif consistency_score < 0.75:
-                    units = min(units, 0.75) # Max GOLD for B-Grade
-                    
-                # Hard Cap (User Rule: Max 1.0u)
-                if units > 1.0: units = 1.0
-                
-                # Determine Badge based on Final Units
-                badge = "LEAN" # < 0.5
-                if units >= 0.5: badge = "STANDARD"
-                if units >= 0.75: badge = "GOLD 🥇"
-                if units >= 1.0: badge = "DIAMOND 💎"
-                
-                # Filter out tiny bets? NO, keep them but mark as NO BET if 0
-                if units < 0.25: 
-                    if f_star > 0: units = 0.25
-                    else: units = 0.0 # No Edge
-                
-                # Check against highest
-                # If units > highest, take it.
-                if units > highest_score:
-                    highest_score = units
-                    best_prop = {
-                        'prop': p_name,
-                        'val': val,
-                        'line_low': val - mae,
-                        'line_high': val + mae,
-                        'units': units,
-                        'badge': badge if units >= 0.25 else "NO BET", # Show NO BET
-                        'consistency': consistency_score,
-                        'mae': mae
-                    }
+                # Check for "Edge" relative to highest score
+                if calc['units'] > highest_score:
+                    highest_score = calc['units']
+                    best_prop = calc
 
-            # Fallback if no prop found (e.g. all 0 units)
+            # Fallback
             if best_prop is None:
                  best_prop = {
-                        'prop': 'PTS', # Default
+                        'prop': 'PTS',
                         'val': pred_pts,
                         'line_low': pred_pts - mae_pts,
                         'line_high': pred_pts + mae_pts,
@@ -569,6 +439,7 @@ class BatchPredictor:
                 'LINE_REB_LOW': float(pred_reb - mae_reb), 'LINE_REB_HIGH': float(pred_reb + mae_reb),
                 'LINE_AST_LOW': float(pred_ast - mae_ast), 'LINE_AST_HIGH': float(pred_ast + mae_ast),
                 'LINE_PRA_LOW': float(pred_pra - mae_pra), 'LINE_PRA_HIGH': float(pred_pra + mae_pra),
+                # Add others if needed for UI Grid
                 
                 # Best Bet (Primary Display)
                 'BEST_PROP': best_prop['prop'],
@@ -599,30 +470,80 @@ class BatchPredictor:
             results_list.append(res)
         
         # 4a. Populate Market Odds & EV
-        if log_manager: await log_manager.broadcast("Fetching market odds...")
-        odds_data = fetch_nba_odds()
+        # 4a. Populate Market Odds & EV
+        if log_manager: await log_manager.broadcast("Fetching market odds for comprehensive analysis...")
+        try:
+            odds_data = fetch_nba_odds()
+        except Exception as e:
+            print(f"CRITICAL ERROR: Failed to fetch odds: {e}")
+            if log_manager: await log_manager.broadcast(f"Error fetching odds: {e}")
+            odds_data = None
         
+        # 4a. Comprehensive Prop Analysis (Populate EV for ALL stats)
         for res in results_list:
-            try:
-                ev_result = get_ev_for_prediction(
-                    player_name=res['PLAYER_NAME'],
-                    stat_type=res['BEST_PROP'],
-                    prediction=res['BEST_VAL'],
-                    model_confidence=min(res.get('CONSISTENCY', 0.5), 0.75),  # Cap at 75%
-                    odds_data=odds_data
-                )
-                if ev_result.get('found'):
-                    res['MARKET_LINE'] = ev_result.get('market_line')
-                    res['MARKET_ODDS'] = ev_result.get('odds_over')
-                    res['EV'] = round(ev_result.get('ev_over', 0) * 100, 1)  # As percentage
-                    res['EV_RECOMMENDATION'] = ev_result.get('recommendation')
-            except Exception as e:
-                pass  # Silently skip if odds lookup fails
+            res['PROPS_ANALYSIS'] = {}
             
-        # 4. Generate "The SUPER Trixie" (3 Players x 3 Bets)
-        # Sort by BADGE TIER then UNITS then CONSISTENCY
-        # Tier Values: Diamond=4, Gold=3, Standard=2, Lean=1, No Bet=0
+            # Map internal keys to stat types
+            stats_to_analyze = [
+                ('PTS', 'PRED_PTS', 'MAE_PTS'),
+                ('REB', 'PRED_REB', 'MAE_REB'),
+                ('AST', 'PRED_AST', 'MAE_AST'),
+                ('3PM', 'PRED_3PM', 'MAE_3PM'),
+                ('BLK', 'PRED_BLK', 'MAE_BLK'),
+                ('STL', 'PRED_STL', 'MAE_STL'),
+                ('RA', 'PRED_RA', 'MAE_REB'), # Approximating MAE for composites 
+                ('PR', 'PRED_PR', 'MAE_REB'), 
+                ('PA', 'PRED_PA', 'MAE_AST'),
+                ('PRA', 'PRED_PRA', 'MAE_PRA')
+            ]
+            
+            for stat_code, pred_key, mae_key in stats_to_analyze:
+                try:
+                    pred_val = res.get(pred_key, 0)
+                    mae_val = res.get(mae_key, 1.0)
+                    
+                    ev_result = get_ev_for_prediction(
+                        player_name=res['PLAYER_NAME'],
+                        stat_type=stat_code,
+                        prediction=pred_val,
+                        std_dev=mae_val, # Use MAE as proxy for Standard Deviation
+                        odds_data=odds_data
+                    )
+                    
+                    if ev_result.get('found'):
+                        res['PROPS_ANALYSIS'][stat_code] = {
+                            'market_line': ev_result.get('market_line'),
+                            'odds_over': ev_result.get('odds_over'),
+                            'p_over': round(ev_result.get('p_over', 0.5) * 100, 1),
+                            'ev_over': round(ev_result.get('ev_over', 0) * 100, 1),
+                            'recommendation': ev_result.get('recommendation')
+                        }
+                        
+                        # If this corresponds to the "Best Prop", update top-level fields for backwards capability
+                        if stat_code == res['BEST_PROP']:
+                            res['MARKET_LINE'] = ev_result.get('market_line')
+                            recommendation = ev_result.get('recommendation')
+                            
+                            # Select the correct EV based on recommendation
+                            if recommendation == 'UNDER':
+                                final_ev = ev_result.get('ev_under', 0)
+                                res['MARKET_ODDS'] = ev_result.get('odds_under') # Also show under odds
+                            else:
+                                final_ev = ev_result.get('ev_over', 0)
+                                res['MARKET_ODDS'] = ev_result.get('odds_over') # Default to Over
+
+                            res['EV'] = round(final_ev * 100, 1)
+                            res['EV_RECOMMENDATION'] = recommendation
+                            
+                except Exception as e:
+                    # print(f"Error analyzing {stat_code} for {res['PLAYER_NAME']}: {e}")
+                    pass
+
+            
+        # 4. Generate "The SMART Trixie" (Mathematical SGP Optimizer)
+        # Goal: Find 3 Players with the highest probability "SGP" (2-3 legs) that pays ~3.0x
         
+        # Sort by BADGE TIER then UNITS then CONSISTENCY for general display
         def get_tier_val(badge):
             if "DIAMOND" in badge: return 4
             if "GOLD" in badge: return 3
@@ -635,124 +556,237 @@ class BatchPredictor:
             x['UNITS'], 
             x['CONSISTENCY']
         ), reverse=True)
-        
-        # DEBUG: Verify Sort Order
-        print("[Sort Debug] Top 5 Sorted Players:")
-        for i, p in enumerate(sorted_res[:5]):
-             print(f"  {i+1}. {p['PLAYER_NAME']} | {p['BADGE']} | {p['UNITS']}u")
-        
-        # QUALITY FILTER: Trixie needs STAR POWER (> 15 PPG + High Consistency)
-        if len(sorted_res) >= 3:
-            legs = []
-            
-            # Iterate through all candidates until we have 3 valid legs
-            # Start with stars, then everyone else
-            prioritized_candidates = [p for p in sorted_res if p.get('SEASON_PTS', 0) > 15.0]
-            rest_candidates = [p for p in sorted_res if p.get('SEASON_PTS', 0) <= 15.0]
-            
-            for p in prioritized_candidates + rest_candidates:
-                if len(legs) >= 3:
-                    break
-                    
-                from src.odds_service import get_player_prop_odds
-                
-                player_bets = []
-                
-                # Check all 3 props for this player
-                for stat in ['PTS', 'REB', 'AST']:
-                    pred_key = f'PRED_{stat}'
-                    pred = p.get(pred_key, 0)
-                    
-                    # Get REAL market line from API
-                    prop_odds = get_player_prop_odds(p['PLAYER_NAME'], stat, odds_data)
-                    
-                    if not prop_odds.get('found'):
-                        continue  # Skip if no market data
-                    
-                    market_line = prop_odds['line']
-                    odds_over = prop_odds['odds_over']
-                    odds_under = prop_odds['odds_under']
-                    
-                    # Calculate edge
-                    edge = pred - market_line
-                    
-                    # Relaxed threshold to ensure we find 3 legs
-                    min_edge = 0.1
-                    
-                    if edge >= min_edge:
-                        # Bet OVER - our prediction exceeds the line
-                        player_bets.append({
-                            'type': 'MAIN' if stat == p.get('BEST_PROP') else 'ANCHOR',
-                            'prop': stat,
-                            'direction': 'OVER',
-                            'target': market_line,
-                            'prediction': pred,
-                            'edge': round(edge, 1),
-                            'desc': f"{stat} O{market_line:.1f}",
-                            'odds': odds_over,
-                            'source': 'market'
-                        })
-                    elif edge <= -min_edge:
-                        # Bet UNDER - our prediction is below the line
-                        player_bets.append({
-                            'type': 'ANCHOR',
-                            'prop': stat,
-                            'direction': 'UNDER',
-                            'target': market_line,
-                            'prediction': pred,
-                            'edge': round(abs(edge), 1),
-                            'desc': f"{stat} U{market_line:.1f}",
-                            'odds': odds_under,
-                            'source': 'market'
-                        })
-                
-                # Enforce strict structure: 1 MAIN + 2 ANCHORS
-                main_bets = [b for b in player_bets if b['type'] == 'MAIN']
-                anchor_bets = [b for b in player_bets if b['type'] == 'ANCHOR']
-                
-                # Sort anchors by edge to get the safest/best ones
-                anchor_bets.sort(key=lambda x: x['edge'], reverse=True)
-                
-                selected_bets = []
-                if main_bets and len(anchor_bets) >= 2:
-                    # Satisfies the "Trixie Maker" requirement
-                    selected_bets = [main_bets[0]] + anchor_bets[:2]
-                else:
-                    # Strict rule: if we can't make the perfect 3-leg SGP, skip this player
-                    selected_bets = []
-                
-                if selected_bets:  # Only add player if they have bettable props
-                    from src.odds_service import american_to_decimal
-                    
-                    # Calculate SGP Odds for this player
-                    sgp_odds = 1.0
-                    for bet in selected_bets:
-                        if bet['type'] == 'MAIN':
-                            # Use REAL odds for the main line
-                            real_decimal = american_to_decimal(bet.get('odds', '-110'))
-                            sgp_odds *= real_decimal
-                        else:
-                            # Use ESTIMATE for safe anchors (since we don't have alt line odds in cache)
-                            sgp_odds *= 1.35  # Safe anchor ~1.35x (-280ish)
-                    
-                    legs.append({
-                        **p, # Include full stats for Modal
-                        'player_name': p['PLAYER_NAME'],
-                        'matchup': p['MATCHUP'],
-                        'bets': selected_bets,
-                        'sgp_odds': round(sgp_odds, 2)
-                    })
 
-            # Calculate Total Trixie Odds (Product of all SGPs)
-            total_trixie_odds = 1.0
-            for leg in legs:
-                total_trixie_odds *= leg['sgp_odds']
+        trixie = None
+        candidate_sgps = [] # tuples of (player_dict, best_sgp_dict, joint_prob)
+        
+        from itertools import combinations
+        from src.odds_service import american_to_decimal
+        
+        # 1. Analyze EVERY player for their best possible SGP
+        for p in sorted_res:
+            # Gather all "Good Bets" for this player
+            good_bets = []
+            
+            # Check stats (updated to include composites)
+            stats_list = ['PTS', 'REB', 'AST', '3PM', 'STL', 'RA', 'PR', 'PA', 'PRA']
+            
+            for stat in stats_list:
+                analysis = p.get('PROPS_ANALYSIS', {}).get(stat)
+                if not analysis: continue
+                
+                rec = analysis.get('recommendation')
+                if rec == 'PASS' or not rec: continue
+                
+                # Get Prob & Odds
+                prob = analysis.get('p_over', 0)
+                if rec == 'UNDER':
+                    prob = 100 - prob # Convert to Under Prob if needed (data seems to be % already)
+                    odds = analysis.get('odds_under')
+                else:
+                    odds = analysis.get('odds_over')
+                
+                # Strict Probability Gate
+                if prob < 55.0: continue
+                
+                # Odds Filter (User Request: Exclude < 1.50 / -200)
+                if american_to_decimal(odds) < 1.50: continue
+                
+                market_line = analysis.get('market_line')
+                
+                good_bets.append({
+                    'prop': stat,
+                    'direction': rec,
+                    'line': market_line,
+                    'prob': prob / 100.0, # Decimal prob
+                    'odds_amer': odds,
+                    'odds_dec': american_to_decimal(odds),
+                    'desc': f"{stat} {rec[0]} {market_line}", # e.g. PTS O 25.5
+                    'prediction': p.get(f'PRED_{stat}'),
+                    'matchup': p.get('MATCHUP') # Store matchup for filtering
+                })
+                
+            # If we don't have enough good bets to make a parlay, skip
+            if len(good_bets) < 2:
+                continue
+                
+            # 2. Find Best SGP Combination (2 or 3 legs)
+            best_sgp = None
+            best_sgp_score = -1
+            
+            # Test all 2-leg and 3-leg combinations
+            for r in [2, 3]:
+                for combo in combinations(good_bets, r):
+                    joint_prob = 1.0
+                    combined_odds = 1.0
+                    
+                    # Count "Safe Legs" (Prob > 60%) to boost score
+                    safe_legs = 0
+                    
+                    for leg in combo:
+                        joint_prob *= leg['prob']
+                        combined_odds *= leg['odds_dec']
+                        if leg['prob'] > 0.60: safe_legs += 1
+                        
+                    # Correlation Penalty
+                    joint_prob *= 0.85
+                    combined_odds *= 0.85 
+                    
+                    if combined_odds < 2.0: continue # Minimum odds floor
+                        
+                    # SCORE CALCULATION
+                    ev = (joint_prob * combined_odds) - 1
+                    score = ev * (joint_prob * 10) 
+                    
+                    # Correlation Boosts
+                    directions = [leg['direction'] for leg in combo]
+                    if all(d == 'UNDER' for d in directions):
+                        score *= 1.30 
+                    elif all(d == 'OVER' for d in directions):
+                        score *= 1.15 
+                    
+                    if score > best_sgp_score:
+                        best_sgp_score = score
+                        best_sgp = {
+                            'legs': combo,
+                            'total_odds': round(combined_odds, 2),
+                            'joint_prob': joint_prob,
+                            'ev_edge': ev
+                        }
+            
+            if best_sgp:
+                candidate_sgps.append({
+                    'player': p,
+                    'sgp': best_sgp,
+                    'score': best_sgp_score,
+                    'matchup': p.get('MATCHUP') # Explicitly bubble up matchup
+                })
+                
+        # 3. Select Top Players (Unique Game Constraint)
+        candidate_sgps.sort(key=lambda x: x['score'], reverse=True)
+        
+        seen_matchups = set()
+        primary_candidates = []
+        
+        # Select Primary (Top 3 Unique Matchups)
+        for cand in candidate_sgps:
+            if len(primary_candidates) >= 3:
+                break
+            
+            m = cand['matchup']
+            if m not in seen_matchups:
+                primary_candidates.append(cand)
+                seen_matchups.add(m)
+        
+        # Select Secondary (Next 3 Unique Matchups)
+        secondary_candidates = []
+        # Continue scanning from where we left off? 
+        # Easier to just rescan list and skip 'seen' from primary phase?
+        # Actually, let's just grab the next valid ones.
+        
+        for cand in candidate_sgps:
+            if cand in primary_candidates: continue # Already picked
+            if len(secondary_candidates) >= 3: break
+            
+            m = cand['matchup']
+            if m not in seen_matchups:
+                 secondary_candidates.append(cand)
+                 seen_matchups.add(m)
+                 
+        # Alternates (Just the next best, regardless of matchup? Or strict?)
+        # Let's keep strict unique for alternates too if possible to maximize options
+        alternates = []
+        for cand in candidate_sgps:
+            if cand in primary_candidates or cand in secondary_candidates: continue
+            if len(alternates) >= 2: break
+             
+            # Allow repeats for alternates? Maybe. But let's try unique first.
+            m = cand['matchup']
+            if m not in seen_matchups:
+                alternates.append(cand)
+                seen_matchups.add(m)
+                
+        # Fallback: If we don't have enough unique alternates, fill with whatever is left (duplicates allowed)
+        if len(alternates) < 2:
+            for cand in candidate_sgps:
+                if cand in primary_candidates or cand in secondary_candidates or cand in alternates: continue
+                if len(alternates) >= 2: break
+                alternates.append(cand)
+
+        trixie = None
+        
+        # Helper to format SGP and calc Units
+        def format_sgp_legs(candidates):
+            formatted_list = []
+            for item in candidates:
+                p = item['player']
+                sgp = item['sgp']
+                prob = sgp['joint_prob']
+                odds = sgp['total_odds']
+                
+                # Dynamic Sizing for Single Leg (Player SGP)
+                rec_leg_units = 0.1
+                if prob > 0.50: rec_leg_units = 0.5
+                elif prob > 0.35: rec_leg_units = 0.25
+                elif prob > 0.25: rec_leg_units = 0.15
+                
+                formatted_bets = []
+                for b in sgp['legs']:
+                    formatted_bets.append({
+                        'type': 'LEG', 
+                        'prop': b['prop'],
+                        'direction': b['direction'],
+                        'target': b['line'],
+                        'prediction': b['prediction'],
+                        'desc': b['desc'],
+                        'odds': b['odds_amer'],
+                        'prob': b['prob'] * 100
+                    })
+                
+                formatted_list.append({
+                    **p,
+                    'player_name': p['PLAYER_NAME'],
+                    'matchup': p['MATCHUP'],
+                    'bets': formatted_bets,
+                    'sgp_odds': odds,
+                    'win_prob': prob * 100,
+                    'rec_units': rec_leg_units
+                })
+            return formatted_list
+
+        if len(primary_candidates) == 3:
+            primary_legs = format_sgp_legs(primary_candidates)
+            primary_total_odds = 1.0
+            primary_joint_prob = 1.0
+            
+            for leg in primary_legs: 
+                primary_total_odds *= leg['sgp_odds']
+                # primary_joint_prob *= (leg['win_prob'] / 100.0) # Careful with multiplying probs of dependent events?
+                # Actually, unique games = independent events. So simple multiplication is valid.
+                primary_joint_prob *= (leg['win_prob'] / 100.0)
+                
+            # Dynamic Trixie Units
+            trixie_units = 0.1
+            if primary_joint_prob * primary_total_odds > 1.2: # EV > +20%
+                trixie_units = 0.25
+            
+            secondary_legs = []
+            secondary_total_odds = 0
+            if len(secondary_candidates) == 3:
+                secondary_legs = format_sgp_legs(secondary_candidates)
+                secondary_total_odds = 1.0
+                for leg in secondary_legs: secondary_total_odds *= leg['sgp_odds']
+
+            formatted_alternates = format_sgp_legs(alternates)
             
             trixie = {
-                'sgp_legs': legs,
-                'total_odds': round(total_trixie_odds, 2),
-                'rec_units': 0.1, # Suggest small unit size for high odds (Trixie/Parlay)
-                'potential_return': round(total_trixie_odds * 0.1, 2)
+                'sgp_legs': primary_legs,
+                'secondary_legs': secondary_legs if secondary_legs else None,
+                'alternates': formatted_alternates,
+                'total_odds': round(primary_total_odds, 2),
+                'secondary_total_odds': round(secondary_total_odds, 2) if secondary_legs else 0,
+                'rec_units': trixie_units,
+                'potential_return': round(primary_total_odds * trixie_units, 2)
             }
             
         return {'predictions': sorted_res, 'trixie': trixie}

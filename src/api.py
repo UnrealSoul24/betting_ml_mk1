@@ -287,3 +287,29 @@ async def analyze_today(req: AnalysisRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+class CustomBetRequest(BaseModel):
+    player_id: int
+    prop_type: str # 'PTS', 'REB', 'RA', etc.
+    custom_line: float
+    prediction: float
+    mae: float
+    recent_stats: Optional[dict] = None
+
+@app.post("/analyze-custom-bet")
+async def analyze_custom_bet(req: CustomBetRequest):
+    """
+    Recalculates units and badge for a user-supplied custom line.
+    """
+    from src.bet_sizing import calculate_bet_quality
+    
+    # Calculate Quality
+    result = calculate_bet_quality(
+        prop_name=req.prop_type,
+        val=req.prediction,
+        mae=req.mae,
+        line=req.custom_line,
+        recent_stats=req.recent_stats if req.recent_stats else {}
+    )
+    
+    return result
