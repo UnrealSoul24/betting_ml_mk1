@@ -69,6 +69,11 @@ class NBAPredictor(nn.Module):
         self.logvar_head = nn.Linear(64, 6)  # Log-variance
         
     def forward(self, p_idx, t_idx, x_cont, m_idx):
+        # Safety: Clamp indices to avoid crashes
+        p_idx = torch.clamp(p_idx, 0, self.player_emb.num_embeddings - 1)
+        t_idx = torch.clamp(t_idx, 0, self.team_emb.num_embeddings - 1)
+        m_idx = torch.clamp(m_idx, 0, self.player_emb.num_embeddings - 1)
+
         p_emb = self.player_emb(p_idx)
         t_emb = self.team_emb(t_idx)
         m_emb = self.player_emb(m_idx).sum(dim=1)

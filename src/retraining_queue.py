@@ -70,15 +70,21 @@ class RetrainingQueue:
                 
 
                 
-                # Run training subprocess (non-blocking)
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=str(PROJECT_ROOT)
-                )
+                # Run training subprocess (Blocking wrapped in Thread)
+                # Fix for Windows NotImplementedError (SelectorEventLoop)
+                def run_sync():
+                    return subprocess.run(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        cwd=str(PROJECT_ROOT)
+                    )
                 
-                stdout, stderr = await process.communicate()
+                # Run in thread
+                process = await asyncio.to_thread(run_sync)
+                
+                stdout = process.stdout
+                stderr = process.stderr
                 
                 if process.returncode == 0:
                     duration = (datetime.now() - start_time).total_seconds()
@@ -91,7 +97,7 @@ class RetrainingQueue:
                     })
                 else:
                     print(f"[Retrain] ❌ Player {player_id} FAILED")
-                    print(f"  STDOUT: {stdout.decode()[:500]}") # Debug: Show stdout too
+                    print(f"  STDOUT: {stdout.decode()[:500]}")
                     print(f"  STDERR: {stderr.decode()[:500]}")
                     self.failed_jobs.append({
                         'player_id': player_id,

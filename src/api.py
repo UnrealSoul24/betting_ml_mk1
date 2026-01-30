@@ -4,6 +4,10 @@ from pydantic import BaseModel
 import asyncio
 import sys
 import os
+
+# Fix for Windows Subprocess (AsyncIO)
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 import pandas as pd
 from datetime import datetime
 from typing import List, Optional
