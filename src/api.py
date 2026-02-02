@@ -103,35 +103,55 @@ async def analyze_today(req: AnalysisRequest):
     target_date = req.date if req.date else datetime.now().strftime('%Y-%m-%d')
     current_season = "2025-26" # Hardcoded for now, logical
     
-    await log_manager.broadcast(f"Starting Analysis for {target_date}...")
-    
     # ==== INJURY CHANGE DETECTION ====
     if req.check_injuries:
         try:
             from src.retrain_trigger import detect_injury_changes
             from src.retraining_queue import get_queue
             
-            await log_manager.broadcast("🏥 Checking for injury report changes...")
+            # await log_manager.broadcast("🏥 Checking for injury report changes...")
             
             injury_result = detect_injury_changes()
             
-            if injury_result['affected_player_ids']:
-                await log_manager.broadcast(
-                    f"🚨 {len(injury_result['affected_player_ids'])} players affected by injury changes"
-                )
+            affected_ids = injury_result.get('affected_player_ids', [])
+            stats = injury_result.get('stats', {})
+            
+            if affected_ids:
+                count = len(affected_ids)
+                # Get first affected player name for context
+                all_affected = injury_result.get('changes', {}).get('all_affected', [])
+                first_pname = all_affected[0] if all_affected else "unknown"
                 
                 # Queue retraining in background (non-blocking)
                 queue = get_queue()
-                await queue.queue_retraining(injury_result['affected_player_ids'], use_v2=True)
+                await queue.queue_retraining(affected_ids, use_v2=True, trigger_reason=f"injury_change: {first_pname}")
                 
-                await log_manager.broadcast(
-                    f"⏳ Retraining queued for affected players (running in background)"
-                )
-            else:
-                await log_manager.broadcast("✅ No injury changes detected")
+                await log_manager.broadcast(f"⏳ Retraining queued for {count} players...")
+            # else:
+            #     await log_manager.broadcast("✅ No injury changes detected")
         except Exception as e:
             await log_manager.broadcast(f"⚠️ Injury check failed: {str(e)[:100]}")
-            # Continue with predictions even if injury check fails
+            
+    # ==== ACCURACY TRIGGER CHECK ====
+    if req.check_injuries: 
+        try:
+             from src.retrain_trigger import check_accuracy_triggers
+             # await log_manager.broadcast("🎯 Checking post-injury prediction accuracy...")
+             
+             acc_triggers = check_accuracy_triggers()
+             
+             if acc_triggers:
+                 count = len(acc_triggers)
+                 from src.retraining_queue import get_queue
+                 queue = get_queue()
+                 await queue.queue_retraining(acc_triggers, use_v2=True, trigger_reason="accuracy_degradation")
+                 await log_manager.broadcast(f"⏳ Accuracy retraining queued for {count} players...")
+                 
+        except Exception as e:
+             pass # Silent fail for accuracy check
+    
+    affected_count = len(affected_ids) if 'affected_ids' in locals() else 0
+    await log_manager.broadcast(f"✅ Injuries checked ({affected_count} players affected)")
     
     # ==== CONTINUE WITH NORMAL PREDICTION FLOW ====
     
@@ -142,14 +162,14 @@ async def analyze_today(req: AnalysisRequest):
         return {"message": "No games found", "results": []}
     
     team_ids = set(scoreboard['HOME_TEAM_ID'].unique().tolist() + scoreboard['VISITOR_TEAM_ID'].unique().tolist())
-    await log_manager.broadcast(f"Found {len(team_ids)} teams playing today.")
+    # await log_manager.broadcast(f"Found {len(team_ids)} teams playing today.")
     
     all_predictions = []
     
     # 2. Iterate Teams
     
     # 2. Build Execution Plan (Fetch Rosters)
-    await log_manager.broadcast("Building Execution Plan (Fetching Rosters)...")
+    # await log_manager.broadcast("Building Execution Plan (Fetching Rosters)...")
     
     execution_list = []
     
@@ -167,7 +187,7 @@ async def analyze_today(req: AnalysisRequest):
         
     for team_id in team_ids:
         current_team_idx += 1
-        await log_manager.broadcast(f"Scanning Team {current_team_idx}/{total_teams} (ID: {team_id})...")
+        # await log_manager.broadcast(f"Scanning Team {current_team_idx}/{total_teams} (ID: {team_id})...")
         try:
              roster = commonteamroster.CommonTeamRoster(team_id=team_id, season=current_season).get_data_frames()[0]
              
@@ -183,52 +203,39 @@ async def analyze_today(req: AnalysisRequest):
                      'is_home': ctx.get('is_home')
                  })
         except Exception as e:
-             await log_manager.broadcast(f"[WARN] Failed to fetch roster for team {team_id}: {e}")
+             # await log_manager.broadcast(f"[WARN] Failed to fetch roster for team {team_id}: {e}")
+             pass
 
     total_players = len(execution_list)
-    await log_manager.broadcast(f"Plan Built: {total_players} Players identified across {total_teams} Teams.")
+    # await log_manager.broadcast(f"Plan Built: {total_players} Players identified across {total_teams} Teams.")
 
     # ---------------------------------------------------------
     # 3. ON-DEMAND TRAINING (Missing Models)
     # ---------------------------------------------------------
-    await log_manager.broadcast("Checking for missing player models...")
+    # await log_manager.broadcast("Checking for missing player models...")
     missing_pids = []
 
     for item in execution_list:
         pid = item['pid']
-        # Check if pytorch_player_{pid}.pth exists
-        # Note: train_models.py now saves as pytorch_player_{pid}.pth (v2 suffix removed)
         model_path = os.path.join(MODELS_DIR, f'pytorch_player_{pid}.pth')
         
-        # Also check if we have a global model fallback? 
-        # User requested specific models to be trained.
         if not os.path.exists(model_path):
             missing_pids.append(item)
             
     if missing_pids:
         count = len(missing_pids)
-        await log_manager.broadcast(f"⚠️ Found {count} players with missing models. Training them now...")
+        await log_manager.broadcast(f"⏳ Training {count} missing models...")
         
         for i, item in enumerate(missing_pids):
             pid = item['pid']
             pname = item['pname']
             
-            # Skip if recently processed in this loop (duplicates?)
-            # execution_list is unique by nature of loop? No, roster is unique.
-            
-            msg = f"Training [{i+1}/{count}]: {pname}..."
-            await log_manager.broadcast(msg)
-            
             try:
-                # Run training in thread to avoid blocking WebSocket heartbeats
-                # using asyncio.to_thread (requires Python 3.9+)
                 await asyncio.to_thread(train_model, target_player_id=pid)
             except Exception as e:
-                await log_manager.broadcast(f"❌ Failed to train {pname}: {e}")
+                pass
                 
-        await log_manager.broadcast("✅ On-demand training complete.")
-    else:
-        await log_manager.broadcast("✅ All player models present.")
+        # await log_manager.broadcast("✅ On-demand training complete.")
 
     # ---------------------------------------------------------
     # 4. Execute BATCH
@@ -236,26 +243,14 @@ async def analyze_today(req: AnalysisRequest):
     from src.batch_predict import BatchPredictor
     batch_predictor = BatchPredictor()
     
-    # Train missing models first?
-    # Batch Predictor assumes trained models.
-    # We can do a quick pass for training if we want, OR just let Batch Predictor fallback to generic.
-    # The user values speed. Generic fallback is fine for new players.
-    
-    # However, if we need to TRAIN, we should check missing models.
-    # Let's do a quick check? 
-    # For now, let's SKIP training automation in favor of speed, unless explicitly requested.
-    
-    # If req.force_train is True, we can't do batch effectively unless we train first.
     if req.force_train:
-         await log_manager.broadcast("Force Train requested. Retraining ALL identified players...")
+         await log_manager.broadcast("⏳ Force Retraining ALL players...")
          for i, item in enumerate(execution_list):
             pid = item['pid']
-            pname = item['pname']
-            await log_manager.broadcast(f"Force Retrain [{i+1}/{total_players}]: {pname}...")
             try:
                 await asyncio.to_thread(train_model, target_player_id=pid)
             except Exception as e:
-                 await log_manager.broadcast(f"Failed to train {pname}: {e}")
+                 pass
     
     # Running Batch Analysis
     try:
@@ -278,11 +273,10 @@ async def analyze_today(req: AnalysisRequest):
         preds_list = results
         trixie = None
 
-    # sorted_preds = sorted(preds_list, key=lambda x: x['PRED_PTS'] if x['PRED_PTS'] else 0, reverse=True)
-    sorted_preds = preds_list # Already sorted by BatchPredictor (Tier -> Units -> Consistency)
+    sorted_preds = preds_list 
     
-    await log_manager.broadcast(f"Analysis Complete. Generated {len(sorted_preds)} predictions.")
-    return {"predictions": sorted_preds, "trixie": trixie, "results": sorted_preds} # Keep 'results' for legacy compat
+    # await log_manager.broadcast(f"Analysis Complete. Generated {len(sorted_preds)} predictions.")
+    return {"predictions": sorted_preds, "trixie": trixie, "results": sorted_preds}
 
 @app.get("/health")
 def health():
@@ -313,3 +307,75 @@ async def analyze_custom_bet(req: CustomBetRequest):
     )
     
     return result
+
+# --- Retraining & Injury Endpoints ---
+
+class ManualRetrainingRequest(BaseModel):
+    player_ids: List[int]
+    reason: str = "manual_trigger"
+    force_priority: Optional[str] = None  # "CRITICAL", "HIGH", etc.
+
+@app.post("/trigger-retraining")
+async def trigger_manual_retraining(req: ManualRetrainingRequest):
+    """
+    Manually trigger retraining for specific players with injury context.
+    """
+    from src.retrain_trigger import calculate_retraining_priority, queue_injury_retraining, identify_star_players, get_player_team
+    from src.retraining_queue import get_queue
+    
+    # Calculate priorities for requested players
+    priorities = {}
+    stars_map = identify_star_players()
+    
+    for pid in req.player_ids:
+        if req.force_priority:
+            priorities[pid] = {'priority_score': 100, 'tier': req.force_priority, 'reason': req.reason}
+        else:
+            tid = get_player_team(pid)
+            if tid:
+                priorities[pid] = calculate_retraining_priority(pid, "Manual", stars_map, tid)
+            else:
+                priorities[pid] = {'priority_score': 50, 'tier': "MANUAL", 'reason': req.reason}
+    
+    # Queue jobs
+    from src.retraining_queue import get_queue
+    queue = get_queue()
+    await queue.queue_retraining(req.player_ids, use_v2=True, trigger_reason=req.reason)
+    
+    # Log manual trigger
+    await log_manager.broadcast(f"Manual retraining triggered for {len(req.player_ids)} players: {req.reason}")
+    
+    return {
+        "status": "queued",
+        "player_count": len(req.player_ids),
+        "priorities": priorities,
+        "queue_status": queue.get_status()
+    }
+
+@app.get("/retraining-status")
+async def get_retraining_status():
+    """
+    Get current retraining queue status and recent history.
+    """
+    from src.retraining_queue import get_queue
+    
+    queue = get_queue()
+    status = queue.get_status()
+    
+    # Load recent history
+    from src.retrain_trigger import RETRAINING_HISTORY
+    if RETRAINING_HISTORY.exists():
+        df = pd.read_csv(RETRAINING_HISTORY)
+        recent = df.tail(20).to_dict('records')
+    else:
+        recent = []
+    
+    return {
+        "queue": status,
+        "recent_history": recent
+    }
+
+@app.get("/injury-impact-report")
+async def get_injury_impact_report():
+    from src.retrain_trigger import generate_injury_impact_report
+    return generate_injury_impact_report()

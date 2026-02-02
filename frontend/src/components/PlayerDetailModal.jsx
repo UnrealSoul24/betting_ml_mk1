@@ -1,8 +1,11 @@
+import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { X, TrendingUp, TrendingDown, Target, Award, Activity, Zap, BarChart3, Percent, Brain } from "lucide-react";
+import { X, TrendingUp, TrendingDown, Target, Award, Activity, Zap, BarChart3, Percent, Brain, ChevronDown, ChevronUp } from "lucide-react";
 import { clsx } from "clsx";
 
 export default function PlayerDetailModal({ isOpen, onClose, player }) {
+    const [showAdvanced, setShowAdvanced] = useState(false);
+
     if (!isOpen || !player) return null;
 
     // V2 Model Data
@@ -70,6 +73,54 @@ export default function PlayerDetailModal({ isOpen, onClose, player }) {
                         </div>
                     </div>
 
+
+                    {/* Minutes & Injury Context */}
+                    <div className="mx-8 mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {/* Minutes Projection */}
+                        <div className="bg-white/5 border border-white/5 rounded-xl p-4 flex items-center justify-between">
+                            <div>
+                                <div className="text-[10px] text-gray-500 uppercase tracking-widest mb-1 font-bold flex items-center gap-1">
+                                    <Activity size={10} /> Minutes Projection
+                                </div>
+                                <div className="flex items-baseline gap-2">
+                                    <span className="text-2xl font-bold text-white">{player.PRED_MIN?.toFixed(1) || "-"}</span>
+                                    <span className="text-xs text-gray-500">min</span>
+                                </div>
+                            </div>
+                            <div className="text-right">
+                                <div className="text-[10px] text-gray-500">Season Avg</div>
+                                <div className="text-sm font-mono text-gray-300">{player.SEASON_AVG_MIN?.toFixed(1) || "-"}</div>
+                                {player.MIN_DELTA_PCT !== undefined && (
+                                    <div className={clsx(
+                                        "text-xs font-bold",
+                                        player.MIN_DELTA_PCT > 0 ? "text-neon-green" : player.MIN_DELTA_PCT < 0 ? "text-red-400" : "text-gray-500"
+                                    )}>
+                                        {player.MIN_DELTA_PCT > 0 ? "↑" : player.MIN_DELTA_PCT < 0 ? "↓" : ""}{Math.abs(player.MIN_DELTA_PCT).toFixed(0)}% vs avg
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Injury Context */}
+                        {Array.isArray(player.MISSING_TEAMMATES) && player.MISSING_TEAMMATES.length > 0 ? (
+                            <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl p-4">
+                                <div className="text-[10px] text-amber-500 uppercase tracking-widest mb-2 font-bold flex items-center gap-1">
+                                    <Zap size={10} /> Injury Impact
+                                </div>
+                                <div className="flex flex-wrap gap-2">
+                                    {player.MISSING_TEAMMATES.map((teammate, i) => (
+                                        <div key={i} className="px-2 py-1 bg-amber-500/10 rounded text-[10px] text-amber-200 border border-amber-500/20">
+                                            {teammate} <span className="opacity-50">(OUT)</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="bg-white/5 border border-white/5 rounded-xl p-4 flex items-center justify-center opacity-50">
+                                <div className="text-xs text-gray-500 font-mono">No Key Injuries Detected</div>
+                            </div>
+                        )}
+                    </div>
 
                     {/* Vegas & Market Context - Always Show for Consistency */}
                     <div className="mx-8 mt-6 p-4 bg-gradient-to-r from-amber-500/10 to-orange-500/5 border border-amber-500/20 rounded-xl">
@@ -290,6 +341,53 @@ export default function PlayerDetailModal({ isOpen, onClose, player }) {
                             })}
                         </div>
 
+                        {/* Advanced Metrics (Collapsible) */}
+                        <div className="mb-4 border border-white/5 rounded-xl bg-[#0f0f13] overflow-hidden">
+                            <button
+                                onClick={() => setShowAdvanced(!showAdvanced)} // Ensure setShowAdvanced is defined
+                                className="w-full flex items-center justify-between p-3 bg-white/5 hover:bg-white/10 transition-colors"
+                            >
+                                <div className="text-[10px] text-gray-400 uppercase font-bold flex items-center gap-2">
+                                    <Activity size={12} /> Advanced Metrics (Calculated Efficiency)
+                                </div>
+                                {showAdvanced ? <ChevronUp size={14} className="text-gray-400" /> : <ChevronDown size={14} className="text-gray-400" />}
+                            </button>
+
+                            <AnimatePresence>
+                                {showAdvanced && (
+                                    <motion.div
+                                        initial={{ height: 0, opacity: 0 }}
+                                        animate={{ height: "auto", opacity: 1 }}
+                                        exit={{ height: 0, opacity: 0 }}
+                                        className="overflow-hidden"
+                                    >
+                                        <div className="p-4 space-y-2 border-t border-white/5">
+                                            <div className="grid grid-cols-4 text-[9px] text-gray-500 uppercase font-bold mb-2 pl-2">
+                                                <div className="col-span-1">Stat</div>
+                                                <div className="col-span-1 text-center">Rate / Min</div>
+                                                <div className="col-span-1 text-center">Proj Min</div>
+                                                <div className="col-span-1 text-right">Proj Total</div>
+                                            </div>
+                                            {['PTS', 'REB', 'AST', '3PM', 'PRA'].map(stat => {
+                                                const rate = player[`PRED_${stat}_PER_MIN`] || 0;
+                                                const mins = player.PRED_MIN || 0;
+                                                const total = rate * mins;
+
+                                                return (
+                                                    <div key={stat} className="grid grid-cols-4 items-center bg-black/40 rounded p-2 border border-white/5">
+                                                        <div className="col-span-1 font-bold text-gray-300 text-xs">{stat}</div>
+                                                        <div className="col-span-1 font-mono text-neon-blue text-xs text-center">{rate.toFixed(3)}/m</div>
+                                                        <div className="col-span-1 font-mono text-gray-400 text-xs text-center">× {mins.toFixed(1)}m</div>
+                                                        <div className="col-span-1 font-mono text-white font-bold text-right text-xs">= {total.toFixed(1)}</div>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    </motion.div>
+                                )}
+                            </AnimatePresence>
+                        </div>
+
                         {/* Main Recommendation Row */}
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                             <div className="bg-gradient-to-br from-neon-green/5 to-transparent border border-neon-green/20 rounded-xl p-5 flex items-center justify-between relative overflow-hidden">
@@ -314,19 +412,49 @@ export default function PlayerDetailModal({ isOpen, onClose, player }) {
 
                             {/* Analysis + Model Info */}
                             <div className="bg-white/5 border border-white/5 rounded-xl p-5 flex flex-col justify-center">
-                                <div className="text-[10px] text-gray-500 uppercase mb-2 font-bold">Analysis</div>
-                                <div className="text-xs text-gray-300 leading-relaxed mb-3">
+                                {/* Analysis Content */}
+                                <div className="text-[10px] text-gray-500 uppercase mb-2 font-bold flex justify-between items-center">
+                                    <span>Analysis</span>
+                                    {player.MODEL_STATUS && (
+                                        <span className={clsx(
+                                            "leading-none px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider",
+                                            player.MODEL_STATUS === "FRESH" ? "bg-neon-green/10 text-neon-green" :
+                                                player.MODEL_STATUS === "FAILED" ? "bg-red-500/10 text-red-400" :
+                                                    player.MODEL_STATUS === "UNKNOWN" ? "bg-white/5 text-gray-400" : "bg-blue-400/10 text-blue-400"
+                                        )}>
+                                            {player.MODEL_STATUS}
+                                        </span>
+                                    )}
+                                </div>
+
+                                <div className="text-xs text-gray-300 leading-relaxed mb-4">
                                     {player.CONSISTENCY > 0.8
                                         ? "Elite Consistency (A). Low variance detected. Standard sizing approved."
                                         : player.CONSISTENCY > 0.5
                                             ? "Moderate Variance (B). Form is slightly volatile. Stick to recommended sizing."
                                             : "High Volatility (C/D). Position size automatically reduced."}
                                 </div>
-                                {isV2 && (
-                                    <div className="text-[10px] text-neon-purple border-t border-white/5 pt-2 mt-auto">
-                                        <span className="opacity-60">Model outputs probability distribution with learned uncertainty</span>
+
+                                {/* Model Metadata */}
+                                <div className="mt-auto border-t border-white/5 pt-3 space-y-2">
+                                    <div className="flex justify-between text-[10px]">
+                                        <span className="text-gray-500">Last Trained</span>
+                                        <span className="text-gray-300 font-mono">{player.MODEL_LAST_TRAINED || "Unknown"}</span>
                                     </div>
-                                )}
+                                    {player.MODEL_TRIGGER_REASON && (
+                                        <div className="flex justify-between text-[10px]">
+                                            <span className="text-gray-500">Trigger</span>
+                                            <span className="text-amber-400 font-mono">{player.MODEL_TRIGGER_REASON}</span>
+                                        </div>
+                                    )}
+
+                                    {isV2 && (
+                                        <div className="text-[9px] text-neon-purple mt-2 flex items-center gap-1 opacity-80">
+                                            <Brain size={10} />
+                                            <span>Learned Uncertainty Active</span>
+                                        </div>
+                                    )}
+                                </div>
                             </div>
                         </div>
                     </div>

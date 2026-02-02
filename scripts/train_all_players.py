@@ -78,7 +78,7 @@ def main():
         
         try:
             # Train with V2 architecture
-            train_model(target_player_id=pid, use_v2=True)
+            train_model(target_player_id=pid)
             print(f"✓ Player {pid} complete")
         except Exception as e:
             print(f"✗ Player {pid} failed: {e}")

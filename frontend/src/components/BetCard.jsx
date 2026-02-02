@@ -90,21 +90,54 @@ export default function BetCard({ pred, onClick, index }) {
             className="glass-card p-5 rounded-2xl relative overflow-hidden group hover:border-neon-green/50 transition-all cursor-pointer hover:bg-white/5"
         >
             {/* Badge Overlay */}
-            <div className="absolute top-4 right-4 z-10">
+            <div className="absolute top-4 right-4 z-10 flex flex-col items-end gap-1">
                 <div className={clsx(
                     "px-2 py-1 rounded text-[10px] font-bold border",
                     activePred.BADGE.includes("DIAMOND") ? "bg-neon-purple/20 border-neon-purple text-neon-purple" :
                         activePred.BADGE.includes("GOLD") ? "bg-amber-400/20 border-amber-400 text-amber-400" :
                             "bg-white/10 border-white/20 text-gray-400"
                 )}>
-                    {/* Show Custom Badge if Best Prop is modified? Complex. Keep simple for now */}
                     {activePred.BADGE}
                 </div>
+
+                {/* Model Status Badge */}
+                {activePred.MODEL_STATUS && (
+                    <div className={clsx(
+                        "px-2 py-0.5 rounded text-[9px] font-bold border uppercase tracking-wider",
+                        activePred.MODEL_STATUS === "FRESH" ? "bg-neon-green/10 border-neon-green/30 text-neon-green" : "bg-blue-400/10 border-blue-400/30 text-blue-400"
+                    )}>
+                        {activePred.MODEL_STATUS}
+                    </div>
+                )}
             </div>
 
             <div className="mb-4 pr-16" onClick={() => onClick(activePred)}>
                 <h3 className="text-lg font-bold text-white truncate">{activePred.PLAYER_NAME}</h3>
                 <p className="text-xs text-gray-500 font-mono mt-0.5">{activePred.MATCHUP}</p>
+
+                {/* Minutes & Injury Context */}
+                <div className="flex items-center gap-2 mt-2">
+                    {activePred.PRED_MIN !== undefined && (
+                        <div className="text-xs font-mono text-gray-300 bg-white/5 px-1.5 py-0.5 rounded flex items-center gap-1">
+                            <span className="text-gray-500">MIN:</span>
+                            <span className="font-bold text-white">{activePred.PRED_MIN?.toFixed(1) || "-"}</span>
+                            {activePred.MIN_DELTA_PCT !== undefined && (
+                                <span className={clsx(
+                                    "font-bold",
+                                    activePred.MIN_DELTA_PCT > 0 ? "text-neon-green" : activePred.MIN_DELTA_PCT < 0 ? "text-red-400" : "text-gray-500"
+                                )}>
+                                    ({activePred.MIN_DELTA_PCT > 0 ? "↑" : activePred.MIN_DELTA_PCT < 0 ? "↓" : ""}{Math.abs(activePred.MIN_DELTA_PCT).toFixed(0)}% vs avg)
+                                </span>
+                            )}
+                        </div>
+                    )}
+
+                    {activePred.INJURY_IMPACT && (
+                        <div className="text-[10px] font-bold text-amber-400 flex items-center gap-1 bg-amber-400/10 px-1.5 py-0.5 rounded border border-amber-400/20">
+                            <span>⚡ EXPANDED ROLE</span>
+                        </div>
+                    )}
+                </div>
             </div>
 
             {/* Stats Grid */}

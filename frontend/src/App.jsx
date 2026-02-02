@@ -39,16 +39,31 @@ export default function App() {
 
     socket.onopen = () => {
       setIsConnected(true);
-      addLog("System Connected. Ready for Analysis.");
+      addLog("System Connected. Ready for Analysis.", "🔌", "success");
     };
 
     socket.onmessage = (event) => {
-      addLog(event.data);
+      const msg = event.data;
+      const milestoneMap = {
+        "Injuries checked": { icon: "✅", status: "success" },
+        "Retraining queued": { icon: "⏳", status: "loading" },
+        "Predicting minutes": { icon: "⏳", status: "loading" },
+        "Calculating final predictions": { icon: "⏳", status: "loading" },
+        "Analysis complete": { icon: "✅", status: "success" },
+        "Training": { icon: "⏳", status: "loading" },
+      };
+
+      for (const [key, val] of Object.entries(milestoneMap)) {
+        if (msg.toLowerCase().includes(key.toLowerCase())) {
+          addLog(msg, val.icon, val.status);
+          return;
+        }
+      }
     };
 
     socket.onclose = () => {
       setIsConnected(false);
-      addLog("System Disconnected.");
+      addLog("System Disconnected.", "🔌", "error");
     };
 
     setWs(socket);
@@ -65,16 +80,16 @@ export default function App() {
     }
   }, [logs]);
 
-  const addLog = (msg) => {
+  const addLog = (msg, icon = "➜", status = "info") => {
     const time = new Date().toLocaleTimeString();
-    setLogs((prev) => [...prev, `[${time}] ${msg}`]);
+    setLogs((prev) => [...prev, { time, msg, icon, status }]);
   };
 
   const handleRunAnalysis = async () => {
     if (isLoading) return;
     setIsLoading(true);
     setPredictions([]);
-    addLog("Initiating Daily Analysis Sequence...");
+    addLog("Initiating Daily Analysis Sequence...", "⏳", "loading");
 
     try {
       const response = await fetch("http://localhost:8000/analyze-today", {
@@ -89,12 +104,11 @@ export default function App() {
       const data = await response.json();
       if (data.results || data.predictions) {
         setPredictions(data); // Always use full object for new UI
-        addLog(
-          `Analysis Complete. ${data.predictions ? data.predictions.length : (data.results ? data.results.length : 0)} predictions received.`,
-        );
+        const count = data.predictions ? data.predictions.length : (data.results ? data.results.length : 0);
+        addLog(`Analysis Complete. ${count} predictions received.`, "✅", "success");
       }
     } catch (e) {
-      addLog(`CRITICAL ERROR: ${e.message}`);
+      addLog(`CRITICAL ERROR: ${e.message}`, "⚠️", "error");
     } finally {
       setIsLoading(false);
     }
@@ -186,13 +200,18 @@ export default function App() {
                 <span className="opacity-30">Waiting for command...</span>
               )}
               {logs.map((log, i) => {
-                const splitIndex = log.indexOf("]");
-                const timestamp = log.substring(0, splitIndex + 1);
-                const content = log.substring(splitIndex + 1);
+                let textColor = "text-green-400/80";
+                if (log.status === "loading") textColor = "text-blue-400";
+                if (log.status === "success") textColor = "text-neon-green";
+                if (log.status === "error") textColor = "text-red-400";
+
                 return (
-                  <div key={i} className="break-words">
-                    <span className="opacity-50 mr-2">{timestamp}</span>
-                    {content}
+                  <div key={i} className={clsx("break-words flex items-start text-xs font-mono mb-1", textColor)}>
+                    <span className="opacity-30 mr-2 min-w-[60px]">[{log.time}]</span>
+                    <div className="flex-1 flex items-start">
+                      <span className={clsx("mr-2", log.status === "loading" && "animate-pulse")}>{log.icon}</span>
+                      <span>{log.msg}</span>
+                    </div>
                   </div>
                 );
               })}

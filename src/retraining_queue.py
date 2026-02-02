@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import List
 from datetime import datetime
+from src.model_metadata_cache import get_metadata_cache
 
 
 # Paths
@@ -26,15 +27,16 @@ class RetrainingQueue:
         self.failed_jobs = []
         self.sem = asyncio.Semaphore(1) # Limit to 1 (or 2) concurrent trainings to prevent OOM
     
-    async def queue_retraining(self, player_ids: List[int], use_v2: bool = True):
+    async def queue_retraining(self, player_ids: List[int], use_v2: bool = True, trigger_reason: str = "manual"):
         """
         Queue retraining jobs for multiple players.
         
         Args:
             player_ids: List of player IDs to retrain
             use_v2: Whether to use V2 distributional model
+            trigger_reason: Reason for retraining (e.g. 'injury_change', 'accuracy_degradation')
         """
-        print(f"\n[RetrainingQueue] Queuing {len(player_ids)} players for retraining...")
+        print(f"\n[RetrainingQueue] Queuing {len(player_ids)} players for retraining (Reason: {trigger_reason})...")
         
         for player_id in player_ids:
             if player_id in self.active_jobs:
@@ -43,18 +45,19 @@ class RetrainingQueue:
             
             # Create background task
             task = asyncio.create_task(
-                self._retrain_player_model(player_id, use_v2)
+                self._retrain_player_model(player_id, use_v2, trigger_reason)
             )
             self.active_jobs[player_id] = task
             print(f"  ✓ Queued player {player_id}")
     
-    async def _retrain_player_model(self, player_id: int, use_v2: bool = True):
+    async def _retrain_player_model(self, player_id: int, use_v2: bool = True, trigger_reason: str = "manual"):
         """
         Retrain a single player model in the background.
         
         Args:
             player_id: NBA player ID
-            use_v2: Use distributional model (Arg kept for compatibility, ignored logic)
+            use_v2: Use distributional model
+            trigger_reason: Reason for retraining
         """
         async with self.sem: # Critical: Wait for slot
             start_time = datetime.now()
@@ -89,6 +92,16 @@ class RetrainingQueue:
                         'duration_sec': duration,
                         'success': True
                     })
+                    
+                    # Update Metadata Cache
+                    metadata_cache = get_metadata_cache()
+                    metadata_cache.update_metadata(player_id, {
+                        'status': 'active',
+                        'last_trained_duration': duration,
+                        'model_version': 'per_minute_v1' if use_v2 else 'v1',
+                        'trigger_reason': trigger_reason,
+                        'error': None
+                    })
                 else:
                     print(f"[Retrain] ❌ Player {player_id} FAILED")
                     print(f"  STDOUT: {stdout.decode()[:500]}") # Debug: Show stdout too
@@ -98,6 +111,12 @@ class RetrainingQueue:
                         'timestamp': datetime.now().isoformat(),
                         'error': (stderr.decode() + "\nSTDOUT: " + stdout.decode())[:1000],
                         'success': False
+                    })
+                    
+                    # Update Metadata Cache (Failed)
+                    get_metadata_cache().update_metadata(player_id, {
+                        'status': 'failed',
+                        'error': stderr.decode()[:200]
                     })
             
             except Exception as e:

@@ -1,10 +1,14 @@
 {
-    "mae_pts": 4.679479122161865,
-    "mae_reb": 1.9399573802947998,
-    "mae_ast": 1.3548529148101807,
-    "baseline_pts": 7.038655757904053,
-    "baseline_reb": 2.6827542781829834,
-    "baseline_ast": 2.0347635746002197,
-    "date": "2026-01-29",
-    "model_version": "vNext"
+    "mae_pts_per_min": 0.20609338581562042,
+    "mae_reb_per_min": 0.09961424767971039,
+    "mae_ast_per_min": 0.07027871161699295,
+    "mae_fg3m_per_min": 0.048788901418447495,
+    "mae_blk_per_min": 0.020484883338212967,
+    "mae_stl_per_min": 0.03283191844820976,
+    "baseline_mae_pts_per_min": 0.2219826877117157,
+    "alignment_score": 0.8581591818586038,
+    "calibration_enabled": true,
+    "calibration_weight": 0.1,
+    "date": "2026-02-02",
+    "model_version": "per_minute_v1"
 }

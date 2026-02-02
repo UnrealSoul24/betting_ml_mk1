@@ -7,6 +7,7 @@ from datetime import datetime
 from src.data_fetch import fetch_daily_scoreboard
 from src.feature_engineer import FeatureEngineer
 from src.train_models import NBAPredictor # Import model architecture
+from src.injury_service import get_injury_report, load_injury_cache # Step 1: Import
 
 # Constants
 DATA_DIR = os.path.join(os.path.dirname(__file__), '../data')
@@ -60,6 +61,23 @@ def predict_daily(target_player_id: int = None, date_input: str = None, stars_ou
         # 1. Get History Data
         # print("Fetching historical data...") # Silence for API
         df_history = fe.load_all_data()
+        
+        # Step 1: Auto-Fetch Injury Report
+        injury_report = get_injury_report(force_refresh=True)
+        
+        # Step 6: Validation
+        from src.injury_service import load_injury_cache # Ensure import if not at top, but added at top
+        cache_info = load_injury_cache()
+      
+        if cache_info['is_stale']:
+            print(f"⚠️ WARNING: Injury data is {cache_info['age_hours']:.1f} hours old (stale threshold: 2h)")
+            print("   Predictions may not reflect latest injury updates.")
+      
+        if not injury_report:
+            print("❌ CRITICAL: No injury data available. Predictions will lack injury context.")
+        else:
+            print(f"✓ Loaded {len(injury_report)} injuries for context")
+
         
         # 2. Determine Target Date & Game Context
         target_date = date_input if date_input else datetime.now().strftime('%Y-%m-%d')
@@ -132,11 +150,80 @@ def predict_daily(target_player_id: int = None, date_input: str = None, stars_ou
             # 3. Process
             # print(f"Processing features...")
             
+            # Step 2: Pass Injury Report in Overrides
+            
+            # --- DERIVE MISSING IDs for Target Row ---
+            # 1. Get Roster for Team ID (Name -> ID)
+            # Use recent history (this season) to ensure roster is fresh
+            current_season = df_history['SEASON_YEAR'].max()
+            team_roster = df_history[
+                (df_history['TEAM_ID'] == team_id) & 
+                (df_history['SEASON_YEAR'] == current_season)
+            ][['PLAYER_NAME', 'PLAYER_ID']].drop_duplicates()
+            
+            name_to_id = dict(zip(team_roster['PLAYER_NAME'], team_roster['PLAYER_ID']))
+            
+            derived_missing_ids = []
+            
+            # 2. Check Injury Report
+            if injury_report:
+                for p_name, status in injury_report.items():
+                    if status in ['Out', 'Doubtful']: # Filter severity
+                        # Try exact match
+                        mid = name_to_id.get(p_name)
+                        if not mid:
+                            # Try fuzzy/partial match if needed?
+                            # For safety, simplistic check:
+                            for r_name, r_id in name_to_id.items():
+                                if p_name in r_name or r_name in p_name: # "Giannis" in "Giannis Antetokounmpo"
+                                    mid = r_id
+                                    break
+                                    
+                        if mid and mid != target_player_id:
+                            derived_missing_ids.append(mid)
+                            
+            missing_ids_str = "_".join(map(str, derived_missing_ids)) if derived_missing_ids else "NONE"
+            stars_out_count = len(derived_missing_ids) # Simplistic "Stars" count (User asked for derived param)
+            # In reality "Stars" filter usually applies to Top Usage, but here we count all Out Rotation players?
+            # Let's count all derived missing as "Stars Out" for the override metric to be safe/consistent.
+            
+            print(f"Derived Missing Teammates: {missing_ids_str} (Count: {stars_out_count})")
+            # ----------------------------------------
+            
             overrides = {}
-            if stars_out is not None:
-                 overrides[(target_player_id, target_date)] = {'STARS_OUT': stars_out}
+            if target_player_id and target_date:
+                overrides[(target_player_id, target_date)] = {
+                    'INJURY_REPORT': injury_report,
+                    'MISSING_PLAYER_IDS': missing_ids_str,
+                    'STARS_OUT': stars_out_count
+                }
+                # Preserve manual overrides if explicitly provided (CLI high priority)
+                if missing_ids is not None:
+                     overrides[(target_player_id, target_date)]['MISSING_PLAYER_IDS'] = missing_ids
+                if stars_out is not None:
+                    overrides[(target_player_id, target_date)]['STARS_OUT'] = stars_out
             
             df_processed = fe.process(df_history, is_training=False, overrides=overrides)
+            
+            # Step 3: Log Injury Context
+            if target_player_id and target_date:
+                target_dt = pd.to_datetime(target_date)
+                mask = (df_processed['PLAYER_ID'] == target_player_id) & (df_processed['GAME_DATE'] == target_dt)
+                if mask.any():
+                    latest_stats_check = df_processed[mask]
+                    if not latest_stats_check.empty:
+                        missing_ids_str = latest_stats_check['MISSING_PLAYER_IDS'].iloc[0]
+                        opp_score = latest_stats_check.get('OPP_SCORE', pd.Series([0.0])).iloc[0]
+                        injury_severity = latest_stats_check.get('INJURY_SEVERITY_TOTAL', pd.Series([0.0])).iloc[0]
+                        usg_boost = latest_stats_check.get('OPP_USG_BOOST', pd.Series([0.0])).iloc[0]
+                        
+                        if missing_ids_str and missing_ids_str != "NONE":
+                            print(f"\n🏥 Injury Context for {player_name}:")
+                            print(f"   Missing Teammates: {missing_ids_str.replace('_', ', ')}")
+                            print(f"   Injury Severity Weight: {injury_severity:.2f}")
+                            print(f"   Opportunity Score: {opp_score:+.2f}")
+                            print(f"   Expected Usage Boost: {usg_boost:+.1f}%")
+
             
             # 4. Extract Target Row
             target_dt = pd.to_datetime(target_date)
@@ -267,7 +354,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--player_id', type=int, help='ID of player to predict', default=None)
     parser.add_argument('--date', type=str, help='Date to predict (YYYY-MM-DD)', default=None)
-    parser.add_argument('--stars_out', type=int, help='Number of star teammates missing (0-2)', default=None)
+    parser.add_argument('--stars_out', type=int, 
+                        help='[DEPRECATED] Manual override for missing stars. Injury report now auto-detected.', 
+                        default=None)
     parser.add_argument('--missing_ids', type=str, help='Underscore separated list of missing player IDs', default=None)
     args = parser.parse_args()
     
@@ -278,7 +367,8 @@ if __name__ == "__main__":
         try:
             pid = input("Enter Player ID to predict (or Press Enter for all): ")
             date_in = input("Enter Date (YYYY-MM-DD) [Default: Today]: ")
-            stars = input("Stars Out (0, 1, 2) [Default: None]: ")
+            print("Note: Injury report is now automatically fetched. Manual 'stars_out' is optional override.")
+            stars = input("Stars Out Override (0, 1, 2) [Default: Auto-detect]: ")
             missing = input("Missing Player IDs (e.g., 123_456) [Default: None]: ")
             
             p_val = int(pid) if pid.strip() else None

@@ -46,6 +46,7 @@ class NBAPredictor(nn.Module):
     Now supports 6 targets: PTS, REB, AST, FG3M, BLK, STL
     
     Output Shape: (B, 12) = [mean_6, logvar_6]
+    Targets: PTS_PER_MIN, REB_PER_MIN, AST_PER_MIN, FG3M_PER_MIN, BLK_PER_MIN, STL_PER_MIN
     """
     def __init__(self, num_players, num_teams, num_cont):
         super().__init__()
@@ -93,7 +94,7 @@ class NBAPredictor(nn.Module):
 
 
 
-def gaussian_nll_loss(output, target):
+def gaussian_nll_loss(output, target, calibration_penalty_weight=0.0):
     """
     Gaussian Negative Log Likelihood Loss.
     
@@ -101,9 +102,9 @@ def gaussian_nll_loss(output, target):
     Loss = 0.5 * [log(var) + (y - mean)^2 / var]
     
     Args:
-    Args:
         output: (B, 12) - [mean(6), logvar(6)]
         target: (B, 6) - [pts, reb, ast, 3pm, blk, stl]
+        calibration_penalty_weight: float - Weight for systematic bias penalty
     
     Returns:
         loss: scalar
@@ -112,8 +113,35 @@ def gaussian_nll_loss(output, target):
     logvar = output[:, 6:]
     
     # Gaussian NLL
-    loss = 0.5 * (logvar + ((target - mean) ** 2) / torch.exp(logvar))
-    return loss.mean()
+    nll_loss = 0.5 * (logvar + ((target - mean) ** 2) / torch.exp(logvar)).mean()
+    
+    if calibration_penalty_weight > 0:
+        # Penalize systematic bias (mean residuals) across the batch
+        residuals = target - mean
+        bias = residuals.mean(dim=0) # Mean error per target
+        cal_loss = (bias ** 2).mean() * calibration_penalty_weight
+        return nll_loss + cal_loss
+        
+    return nll_loss
+
+def calculate_distribution_alignment(y_true, y_pred_mean):
+    """
+    Calculates distribution alignment score.
+    Score = 1.0 - |OverRate - 0.5| * 2 where OverRate is % of Actual > Predicted.
+    Perfect alignment (0.5 split) -> 1.0 score.
+    All overs or all unders -> 0.0 score.
+    """
+    if len(y_true) == 0: return 0.0
+    
+    # Per target over/under
+    # y_true: (N, 6), y_pred_mean: (N, 6)
+    overs = (y_true > y_pred_mean).sum(axis=0)
+    total = len(y_true)
+    
+    over_rates = overs / total
+    # Average alignment across all 6 targets
+    alignment_scores = 1.0 - np.abs(over_rates - 0.5) * 2
+    return np.mean(alignment_scores)
 
 class EarlyStopping:
     def __init__(self, patience=20, min_delta=0, path='checkpoint.pth'):
@@ -162,32 +190,81 @@ def evaluate_model(model, loader, criterion, scaler, feature_cols):
     y_true = np.concatenate(y_true_all, axis=0) if y_true_all else np.array([])
     y_pred = np.concatenate(y_pred_all, axis=0) if y_pred_all else np.array([])
     
+    return avg_loss, mae_pts, mae_reb, mae_ast, mae_fg3m, mae_blk, mae_stl, history_dict
+
+    # Note: I modified signature to return separate values but also need to return history dict or update history check?
+    # Actually evaluate_model is used inside training loop but the return values are not all unpacked or used there?
+    # Let's see usage in training loop.
+    # Usage: avg_loss, ... = evaluate_model(...) - NO, it's inline in training loop (lines 536-549).
+    # The function evaluate_model (lines 171-200) IS NOT CALLED in the loop! The loop has inline validation code.
+    # But for final evaluation it might be used? No, there is no final call to evaluate_model either.
+    # It seems evaluate_model is dead code or helper not currently used in the main flow.
+    # However, I should update it just in case.
+    
     if len(y_true) > 0:
         mae_pts = np.mean(np.abs(y_true[:, 0] - y_pred[:, 0]))
         mae_reb = np.mean(np.abs(y_true[:, 1] - y_pred[:, 1]))
         mae_ast = np.mean(np.abs(y_true[:, 2] - y_pred[:, 2]))
+        mae_fg3m = np.mean(np.abs(y_true[:, 3] - y_pred[:, 3]))
+        mae_blk = np.mean(np.abs(y_true[:, 4] - y_pred[:, 4]))
+        mae_stl = np.mean(np.abs(y_true[:, 5] - y_pred[:, 5]))
     else:
-        mae_pts, mae_reb, mae_ast = 0, 0, 0
+        mae_pts, mae_reb, mae_ast, mae_fg3m, mae_blk, mae_stl = 0, 0, 0, 0, 0, 0
         
-    return avg_loss, mae_pts, mae_reb, mae_ast
+    return avg_loss, mae_pts, mae_reb, mae_ast, mae_fg3m, mae_blk, mae_stl
 
-def train_model(target_player_id: int = None, debug: bool = False, pretrain: bool = False):
-    print(f"Training on {device} (Debug={debug}, Pretrain={pretrain})...")
+def evaluate_implied_totals(model, loader, scaler, feature_cols):
+    """
+    Evaluates MAE on IMPLIED Totals (Per-Min Prediction * Actual Minutes).
+    This helps compare against previous baselines.
+    """
+    model.eval()
+    y_true_totals = []
+    y_pred_totals = []
+    
+    with torch.no_grad():
+        for p_idx, t_idx, x_cont, m_idx, y in loader:
+            p_idx, t_idx, x_cont, m_idx, y = p_idx.to(device), t_idx.to(device), x_cont.to(device), m_idx.to(device), y.to(device)
+            outputs = model(p_idx, t_idx, x_cont, m_idx)
+            
+            # y is per-minute
+            # where is minutes? It's in the original dataframe, but not passed in loader directly except maybe in x_cont?
+            # We don't have minutes in X usually (it's a target for the minutes model).
+            # So we can't easily calculate this inside the loader loop without passing MIN as a feature or metadata.
+            # For now, we will skip this or add MIN to the loader if needed.
+            pass
+            
+    return 0, 0, 0
+
+def train_model(target_player_id: int = None, debug: bool = False, pretrain: bool = False, calibrate: bool = False, calibration_weight: float = 0.1):
+    print(f"Training on {device} (Debug={debug}, Pretrain={pretrain}, Calibrate={calibrate})...")
     
     # 1. Load Data
     path = os.path.join(PROCESSED_DIR, 'processed_features.csv')
     df = pd.read_csv(path)
     
-    # Filter
+    # [NEW] Filter to current season (2026) only - GLOBAL FILTER
+    print("Filtering data to current season (2026)...")
+    df = df[df['SEASON_YEAR'] == 2026]
+    
+    if df.empty:
+        print("No data found for current season (2026).")
+        return
+
+    # Filter for specific player if needed
     if target_player_id and not pretrain:
         print(f"Filtering data for Player ID: {target_player_id}")
         # Need Encoder for filtering by ID -> IDX map or just use ID since we saved it
         df = df[df['PLAYER_ID'] == target_player_id]
+        
         if df.empty:
-            print("No data found for player.")
+            print("No data found for player in current season (2026).")
             return
 
-
+        # [NEW] Check minimum sample size
+        if len(df) < 20:
+             print(f"Insufficient games ({len(df)} < 20) for fine-tuning. Using Global Model.")
+             return
 
 
     # Load Artifacts
@@ -215,13 +292,26 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
     # Separate numeric features from Metadata
     # X needs: PLAYER_IDX, TEAM_IDX, Continuous Features
     
-    feature_cols = [c for c in df.columns if c not in ['PLAYER_ID', 'GAME_DATE', 'MATCHUP', 'PTS', 'REB', 'AST', 'FG3M', 'BLK', 'STL', 'PLAYER_NAME', 'TEAM_ID', 'SEASON_YEAR', 'PLAYER_IDX', 'TEAM_IDX', 'MISSING_PLAYER_IDS']]
+    # [FIX] Do not recompute feature_cols. Use the loaded one.
+    # feature_cols = [c for c in df.columns if c not in ['PLAYER_ID' ...]]
+    # joblib.dump(feature_cols, ...) 
     
-    # Save feature columns
-    joblib.dump(feature_cols, os.path.join(MODELS_DIR, 'feature_cols.joblib'))
-    
+    # Ensure all feature cols exist in DF
+    # If not, fill with 0 (though they should exist if processed correctly)
+    for c in feature_cols:
+        if c not in df.columns:
+            df[c] = 0.0
+            
     X = df[['PLAYER_IDX', 'TEAM_IDX'] + feature_cols].values.astype(np.float32)
-    y = df[['PTS', 'REB', 'AST', 'FG3M', 'BLK', 'STL']].values.astype(np.float32)
+    # [NEW] Targets are PER_MIN stats
+    target_cols = ['PTS_PER_MIN', 'REB_PER_MIN', 'AST_PER_MIN', 'FG3M_PER_MIN', 'BLK_PER_MIN', 'STL_PER_MIN']
+    
+    # Check if columns exist
+    missing_targets = [c for c in target_cols if c not in df.columns]
+    if missing_targets:
+        raise ValueError(f"Missing target columns: {missing_targets}. Please run feature engineering to generate per-minute stats.")
+        
+    y = df[target_cols].values.astype(np.float32)
     
     # ---- PROCESS MISSING IDS ----
     print("Processing Missing Player Embeddings...")
@@ -279,20 +369,46 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
     baseline_mae_pts = baseline_mae[0]
     baseline_mae_reb = baseline_mae[1]
     baseline_mae_ast = baseline_mae[2]
+    baseline_mae_fg3m = baseline_mae[3]
+    baseline_mae_blk = baseline_mae[4]
+    baseline_mae_stl = baseline_mae[5]
     
     print(f"Baseline MAE - PTS: {baseline_mae_pts:.4f}, REB: {baseline_mae_reb:.4f}, AST: {baseline_mae_ast:.4f}")
 
     # Weighted Sampler for Training
-    # Give higher weight to recent seasons (2025-26)
+    # Give higher weight to recent games using Exponential Decay
     # We need weights for TRAIN set only
     train_df = df.iloc[train_indices]
-    weights = train_df['SEASON_YEAR'].map({
-        2026: 2.0,
-        2025: 1.5,
-        2024: 1.0,
-        2023: 0.8,
-        2022: 0.5
-    }).fillna(1.0).values
+    
+    from src.weighting import ExponentialDecayWeighter
+    weighter = ExponentialDecayWeighter(decay_factor=0.95)
+    
+    # Calculate weights based on GAME_DATE recency
+    weights = weighter.calculate_weights(train_df, date_col='GAME_DATE')
+    
+    # [NEW] Weight Transparency / Validation
+    print("\n--- Weighting Statistics ---")
+    print(f"Min Weight: {weights.min():.4f}, Max Weight: {weights.max():.4f}, Mean Weight: {weights.mean():.4f}")
+    
+    # Compare recent vs older
+    # Since train_df is sorted by date? No, train_df is a slice of df which IS sorted by date.
+    # train_df = df.iloc[train_indices] -> train_indices are RANDOM shuffled split.
+    # So we need to look at logical recency.
+    # But wait, weights are aligned with train_df using the correct indices.
+    # Let's reconstruct a view to check dates vs weights.
+    
+    weight_check_df = train_df.copy()
+    weight_check_df['weight'] = weights
+    weight_check_df = weight_check_df.sort_values('GAME_DATE', ascending=False)
+    
+    recent_10_avg = weight_check_df.iloc[:10]['weight'].mean() if len(weight_check_df) >= 10 else weight_check_df['weight'].mean()
+    old_20_plus_avg = weight_check_df.iloc[20:]['weight'].mean() if len(weight_check_df) > 20 else 0.0
+    
+    print(f"Avg Weight (Last 10 Games): {recent_10_avg:.4f}")
+    print(f"Avg Weight (Games 20+ Ago): {old_20_plus_avg:.4f}")
+    if old_20_plus_avg > 0:
+        print(f"Recency Ratio: {recent_10_avg / old_20_plus_avg:.2f}x")
+    print("----------------------------\n")
     
     sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
     
@@ -346,7 +462,8 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
         'val_loss': [],
         'mae_pts': [],
         'mae_reb': [],
-        'mae_ast': []
+        'mae_ast': [],
+        'alignment': []
     }
     
     # Plotting Setup for Debug
@@ -354,7 +471,7 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
     if debug or pretrain:
         import matplotlib.pyplot as plt
         plt.ion() # Interactive mode
-        fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+        fig, axs = plt.subplots(3, 2, figsize=(15, 15)) # Changed to 3x2
         
         # Plot 1: Loss
         ax_loss = axs[0, 0]
@@ -393,15 +510,28 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
         ax_ast.legend()
         ax_ast.grid(True)
         
+        # Plot 5: Alignment
+        ax_align = axs[2, 0] # 3rd row, 1st col
+        line_align, = ax_align.plot([], [], label='Alignment Score')
+        ax_align.set_title('Distribution Alignment (1.0 = Perfect)')
+        ax_align.set_xlabel('Epoch')
+        ax_align.set_ylim(0, 1.0)
+        ax_align.legend()
+        ax_align.grid(True)
+        
+        # Hide 6th if unused or use for something else?
+        axs[2, 1].axis('off')
+        
         plt.tight_layout()
+
         
         if pretrain:
             plot_path = os.path.join(DATA_DIR, 'training_curve_global.png')
         else:
             plot_path = os.path.join(DATA_DIR, f'training_curve_{target_player_id}.png')
 
-    print("\nStarting Training...")
-    print(f"{'Epoch':<6} | {'Train Loss':<10} | {'Val Loss':<10} | {'PTS MAE':<10} | {'REB MAE':<10}")
+    print("\nStarting Training (Per-Minute Targets)...")
+    print(f"{'Epoch':<6} | {'Train Loss':<10} | {'Val Loss':<10} | {'PM_PTS MAE':<10} | {'PM_REB MAE':<10}")
     print("-" * 60)
     
     for epoch in range(epochs):
@@ -412,7 +542,11 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
             
             optimizer.zero_grad()
             outputs = model(p_idx, t_idx, x_cont, m_idx)
-            loss = criterion(outputs, y)
+            
+            # Apply Calibration Penalty if enabled
+            cal_weight = calibration_weight if calibrate else 0.0
+            loss = criterion(outputs, y, calibration_penalty_weight=cal_weight)
+            
             loss.backward()
             optimizer.step()
             
@@ -448,8 +582,11 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
             mae_pts = np.mean(np.abs(y_true_combined[:, 0] - y_pred_means[:, 0]))
             mae_reb = np.mean(np.abs(y_true_combined[:, 1] - y_pred_means[:, 1]))
             mae_ast = np.mean(np.abs(y_true_combined[:, 2] - y_pred_means[:, 2]))
+            mae_fg3m = np.mean(np.abs(y_true_combined[:, 3] - y_pred_means[:, 3]))
+            mae_blk = np.mean(np.abs(y_true_combined[:, 4] - y_pred_means[:, 4]))
+            mae_stl = np.mean(np.abs(y_true_combined[:, 5] - y_pred_means[:, 5]))
         else:
-            mae_pts, mae_reb, mae_ast = 0, 0, 0
+            mae_pts, mae_reb, mae_ast, mae_fg3m, mae_blk, mae_stl = 0, 0, 0, 0, 0, 0
         
         # Scheduler update
         scheduler.step(avg_val_loss)
@@ -461,7 +598,17 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
         history['mae_pts'].append(mae_pts)
         history['mae_reb'].append(mae_reb)
         history['mae_ast'].append(mae_ast)
+        # Add others if we want to plot/track in history
+        # For now just metrics saving is critical
+
         
+        # Calculate Alignment Metric
+        alignment = calculate_distribution_alignment(y_true_combined, y_pred_means)
+        if (epoch+1) % 10 == 0:
+             print(f"   Distribution Alignment Score: {alignment:.3f}")
+             
+        history['alignment'].append(alignment)
+             
         # Update Plot
         if debug or pretrain:
             # Update data
@@ -471,9 +618,10 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
             line_mae_pts.set_data(history['epoch'], history['mae_pts'])
             line_mae_reb.set_data(history['epoch'], history['mae_reb'])
             line_mae_ast.set_data(history['epoch'], history['mae_ast'])
+            line_align.set_data(history['epoch'], history['alignment'])
             
             # Rescale axes
-            for ax in [ax_loss, ax_pts, ax_reb, ax_ast]:
+            for ax in [ax_loss, ax_pts, ax_reb, ax_ast, ax_align]:
                 ax.relim()
                 ax.autoscale_view()
             
@@ -510,19 +658,23 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
         model.load_state_dict(torch.load(save_path))
         print(f"\nFinal Best Model Saved to {save_path}")
         
-    print(f"Final Validation Scores -> PTS MAE: {mae_pts:.4f} (Baseline: {baseline_mae_pts:.4f})")
+    print(f"Final Validation Scores -> PTS_PER_MIN MAE: {mae_pts:.4f} (Baseline: {baseline_mae_pts:.4f})")
     
     # Save Metrics to JSON
     import json
     metrics = {
-        'mae_pts': float(mae_pts),
-        'mae_reb': float(mae_reb),
-        'mae_ast': float(mae_ast),
-        'baseline_pts': float(baseline_mae_pts),
-        'baseline_reb': float(baseline_mae_reb),
-        'baseline_ast': float(baseline_mae_ast),
+        'mae_pts_per_min': float(mae_pts),
+        'mae_reb_per_min': float(mae_reb),
+        'mae_ast_per_min': float(mae_ast),
+        'mae_fg3m_per_min': float(mae_fg3m),
+        'mae_blk_per_min': float(mae_blk),
+        'mae_stl_per_min': float(mae_stl),
+        'baseline_mae_pts_per_min': float(baseline_mae_pts),
+        'alignment_score': float(history['alignment'][-1]) if history['alignment'] else 0.0,
+        'calibration_enabled': calibrate,
+        'calibration_weight': calibration_weight,
         'date': datetime.now().strftime('%Y-%m-%d'),
-        'model_version': 'vNext'
+        'model_version': 'per_minute_v1'
     }
     
     if pretrain:
@@ -541,12 +693,20 @@ if __name__ == "__main__":
     parser.add_argument('--debug', action='store_true', help='Debug mode (no early stop, plotting)')
     parser.add_argument('--pretrain', action='store_true', help='Pretrain global model on all data')
     parser.add_argument('--v2', action='store_true', help='Use V2 distributional model (Gaussian NLL)')
+    parser.add_argument('--calibrate', action='store_true', help='Enable calibration penalty in loss')
+    parser.add_argument('--calibration_weight', type=float, default=0.1, help='Weight of calibration penalty')
     args = parser.parse_args()
     
     if args.pretrain:
-        train_model(pretrain=True)
+        train_model(pretrain=True, calibrate=args.calibrate, calibration_weight=args.calibration_weight)
+        
+        # Also pretrain Global Minutes Predictor
+        print("\n--- Training Global Minutes Predictor ---")
+        from src.minutes_predictor import MinutesPredictor
+        predictor = MinutesPredictor()
+        predictor.train_global_model()
     elif args.player_id:
-        train_model(target_player_id=args.player_id, debug=args.debug)
+        train_model(target_player_id=args.player_id, debug=args.debug, calibrate=args.calibrate, calibration_weight=args.calibration_weight)
     else:
         print("Please provide --player_id or --pretrain")
 

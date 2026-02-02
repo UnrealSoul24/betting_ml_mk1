@@ -1,58 +1,74 @@
-# NBA Player Prop Prediction System (v3.0)
+# Antigravity NBA Predictor (v4.0)
 
-A professional-grade Machine Learning system for predicting NBA player stats (Points, Rebounds, Assists, 3-Pointers, Blocks, Steals) using PyTorch neural networks and advanced feature engineering (Defense vs. Position, Head-to-Head history, Injury Impact).
+A professional-grade Machine Learning system for NBA player prop betting, featuring a dual-stage prediction architecture, real-time odds integration, and automated strategy generation (SGPs/Trixies).
 
 ![Distributional Model](https://img.shields.io/badge/Model-Distributional%20%28Gaussian%20NLL%29-blue)
 ![PyTorch](https://img.shields.io/badge/Backend-PyTorch-orange)
 ![FastAPI](https://img.shields.io/badge/API-FastAPI-green)
+![React](https://img.shields.io/badge/Frontend-React%20%2B%20Vite-blueviolet)
 
 ## 🚀 Key Features
 
-- **6 Prediction Targets**: Points, Rebounds, Assists, 3PM, Blocks, Steals.
-- **Distributional Modeling**: Outputs both *predicted value* and *uncertainty* (confidence interval) for every stat.
-- **Advanced Context**:
-    - **Defense vs. Position (DvP)**: How well the opponent defends specific positions.
-    - **Teammate Impact**: Adjusts predictions when star teammates (e.g., Embiid, Giannis) are injured.
-    - **Vegas Adjustment**: Calibrates predictions based on the game's total (Over/Under).
-- **On-Demand Training**: Automatically trains detailed player-specific models on-the-fly when you request a prediction.
+### 🧠 Dual-Stage Prediction Engine
+Unlike simple regression models, this system separates **Opportunity** from **Ability**:
+1.  **Minutes Predictor**: A specialized model estimates playing time based on rotation changes, "Stars Out" impact, injury severity, blowout potential, and rest days.
+2.  **Efficiency Model**: A distributional neural network predicts per-minute production (PTS/min, REB/min, etc.) and their associated uncertainties.
+**Final Projection** = `Predicted Minutes × Predicted Efficiency`
 
-## 🛠️ Installation
+### 🔄 Smart Retraining & Lifecycle
+- **Just-in-Time Training**: The system detects when a player's model is missing, stale, or drifting in accuracy.
+- **Trigger-Based Updates**: Retraining is automatically triggered by:
+    - 🏥 **Injury Events**: Major rotation changes (e.g., "Embiid Out" triggers Maxey retrain).
+    - 📉 **Accuracy Drift**: If recent predictions deviate beyond thresholds.
+    - ⏱ **Staleness**: Periodic refreshes.
+- **Exponential Decay**: Training data is weighted by recency to capture current form.
 
-1.  **Clone & Environment**
-    ```bash
-    git clone <repo_url>
-    cd betting_ml_mk1
-    python -m venv venv
-    
-    # Windows
-    .\venv\Scripts\activate
-    # Mac/Linux
-    source venv/bin/activate
-    ```
+### 💰 Advanced Betting Logic
+- **EV Calculation**: Compares model confidence intervals against real-time market odds to find positive Expected Value.
+- **SGP & Trixie Generation**: Automatically constructs:
+    - **Same Game Parlays (SGP)**: Correlated props from the same match.
+    - **Trixies**: System bets combining high-confidence edges from different games (3 doubles + 1 treble).
 
-2.  **Install Dependencies**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(Ensure you have PyTorch installed for your specific CUDA version if using GPU)*
+### 📊 Modern Dashboard
+A React+Vite frontend allows you to:
+- View daily "Best Bets" and Trixie recommendations.
+- Inspect detailed player cards with "Matchup", "Injury Impact", and "Last 5" analysis.
+- Monitor background retraining jobs via WebSocket logs.
 
-## 🚦 Quick Start (The "Daily" Flow)
+---
+
+## 🛠️ Architecture
+
+### Tech Stack
+- **Backend**: Python 3.10+, FastAPI, PyTorch, Pandas, Numpy.
+- **Frontend**: React, Vite, TailwindCSS.
+- **Data**: Live NBA Stats API, Odds API integration.
+
+### Core Modules
+- `src/minutes_predictor.py`: Manages the playing time model.
+- `src/batch_predict.py`: Orchestrates the daily prediction interaction.
+- `src/retraining_queue.py`: Manages background model updates.
+- `src/feature_engineer.py`: Generates 50+ contextual features (DvP, Pace, Rest, etc.).
+- `src/bet_sizing.py`: Calculates Kelly Criterion and EV.
+
+---
+
+## 🚦 Usage
 
 ### 1. Start the Backend API
-The easiest way to use the system is via the Web Dashboard.
+The API handles data fetching, model training, and prediction generation.
 
 ```bash
-cd .\betting_ml_mk1\
 uvicorn src.api:app --reload
 ```
 - API runs at: `http://localhost:8000`
 - API Logs: `http://localhost:8000/logs` (WebSocket)
 
-### 2. Start the Frontend (Optional)
-If you have the React frontend set up (in `/frontend`):
+### 2. Start the Frontend
+The React dashboard provides the visual interface.
 
 ```bash
-cd .\betting_ml_mk1\frontend
+cd frontend
 npm run dev
 ```
 - Dashboard: `http://localhost:5173`
@@ -61,16 +77,16 @@ npm run dev
 1. Open the Dashboard.
 2. Click **"Find Today's Bets"**.
 3. The system will:
-    - active Fetch today's NBA schedule.
-    - 🏥 Check the latest injury reports.
-    - 🧠 **Automatically Train** models for any active players who don't have one yet.
-    - 🔮 Generate predictions and find value bets.
+    - Fetch today's schedule and odds.
+    - Check the latest injury reports.
+    - **Automatically Train** models for any active players who don't have one yet.
+    - Generate predictions and find value bets.
 
 ---
 
-## 💻 CLI Commands (Manual Usage)
+## � CLI Commands (Manual Usage)
 
-You can also run individual components manually from the terminal.
+You can also run individual components manually from the terminal for debugging or specific tasks.
 
 ### 1. Data Setup (One-Time / Periodic)
 Download historical game logs and generate features.
@@ -82,12 +98,12 @@ python src/data_fetch.py
 # Process features (DvP, Rolling Stats, etc.)
 python src/feature_engineer.py
 
-# Pretrain Global Model (Required for Transfer Learning)
+# Pretrain Global Model & Minutes Predictor
 python -m src.train_models --pretrain
 ```
 
 ### 2. Train a Player Model Manually
-Training is handled automatically by the API, but you can force-train a specific player.
+The API handles this automatically, but you can force-train a specific player.
 
 ```bash
 # Train LeBron James (ID: 2544)
@@ -103,42 +119,39 @@ python -m src.daily_predict --player_id 2544
 
 ---
 
-## 📂 Project Structure
+## �📂 Project Structure
 
 ```text
 ├── data/
-│   ├── raw/               # Downloaded NBA game logs (.csv)
+│   ├── raw/               # Downloaded NBA game logs
 │   ├── processed/         # Engineered features ready for training
-│   └── models/            # Saved PyTorch models (.pth) and scalers
+│   ├── models/            # Saved PyTorch models (.pth) and scalers
+│   └── cache/             # Cached injury reports and metadata
 ├── src/
 │   ├── api.py             # FastAPI backend implementation
 │   ├── batch_predict.py   # High-performance batch prediction engine
-│   ├── feature_engineer.py# Feature generation logic (DvP, H2H)
+│   ├── minutes_predictor.py # Minutes prediction logic
+│   ├── feature_engineer.py# Feature generation (DvP, H2H, Rest)
 │   ├── train_models.py    # PyTorch model definition & training loop
-│   ├── daily_predict.py   # CLI inference script
 │   └── odds_service.py    # Fetches market odds / Calculates EV
-└── frontend/              # (Optional) React Dashboard
+├── frontend/              # React Dashboard
+└── tests/                 # Unit and integration tests
 ```
 
-## 🧠 Model Architecture
-
-The system uses a **Distributional Regression Network**:
-- **Inputs**: 
-    - Player Embedding (ID)
-    - Team/Opponent Embeddings
-    - 50+ Continuous Features (Rolling Avgs, DvP, H2H, Rest Days)
-    - "Missing Teammates" Embedding (Contextual Impact)
-- **Outputs** (12 dimensions):
-    - **Means (6)**: Expected value for Pts, Reb, Ast, 3PM, Blk, Stl.
-    - **Log-Variances (6)**: Learned uncertainty for each stat (allows calculating confidence intervals).
+## 🧠 Theory: Distributional Modeling
+The system outputs a probability distribution for every stat, not just a single number. This allows us to calculate the probability of hitting a specific line (e.g., "Over 24.5 Points"). The model learns the **Aleatoric Uncertainty** (inherent noise) of each player.
 
 ## ⚠️ Troubleshooting
 
-**"Model not found" / "Size Mismatch"**
-- **Cause**: Feature definitions changed (e.g., added new stats).
-- **Fix**: The system is designed to auto-fix this. Just running the API prediction will cause it to notice the mismatch/missing file and trigger a retrain.
-- **Manual Fix**: Delete `data/models/*.pth` and run prediction again.
+**"Model not found"**
+The system is designed to auto-heal. If a model is missing, simply running a prediction for that player (via API or Dashboard) will trigger a background training job.
 
 **"No games found"**
-- **Cause**: No NBA games scheduled for the current date.
-- **Fix**: Wait for a game day or test with a specific date using `python -m src.daily_predict --date YYYY-MM-DD`.
+Ensure that today is actually a game day. You can verify the schedule in `data/cache` or check NBA.com.
+
+**Environment Setup**
+Ensure you have installed dependencies:
+```bash
+pip install -r requirements.txt
+```
+(GPU support recommended for faster training, but CPU works fine for inference).

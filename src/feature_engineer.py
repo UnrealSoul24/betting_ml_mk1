@@ -4,6 +4,8 @@ import os
 import joblib
 from sklearn.preprocessing import LabelEncoder
 from typing import List, Dict
+from src.injury_service import _fuzzy_match_player_name
+
 
 # Constants
 DATA_DIR = os.path.join(os.path.dirname(__file__), '../data')
@@ -26,6 +28,11 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), '../data')
 RAW_DIR = os.path.join(DATA_DIR, 'raw')
 PROCESSED_DIR = os.path.join(DATA_DIR, 'processed')
 MODELS_DIR = os.path.join(DATA_DIR, 'models')
+WITH_WITHOUT_CACHE_PATH = os.path.join(DATA_DIR, 'cache', 'with_without_splits.joblib')
+
+INJURY_SEVERITY_WEIGHTS = {'Out': 1.0, 'Doubtful': 0.7, 'Questionable': 0.3, 'Active': 0.0}
+MIN_SPLIT_SAMPLE_SIZE = 5
+MAX_OPPORTUNITY_BOOST = 15.0
 
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -135,8 +142,38 @@ class FeatureEngineer:
         # Fill NaNs (start of season)
         for col in ['ROLL_def_PTS', 'ROLL_def_REB', 'ROLL_def_AST']:
             df[col] = df[col].fillna(df[col].mean()) # Fill with global average
+        
+        # 4. Per-Minute DvP (NEW)
+        # We need sum of MIN for the position group to calculate rates
+        # Re-aggregate including MIN
+        def_stats_advanced = df.groupby(['GAME_DATE', agg_key, 'POSITION_SIMPLE'])[['PTS', 'REB', 'AST', 'MIN']].sum().reset_index()
+        def_stats_advanced.columns = ['GAME_DATE', agg_key, 'POSITION_SIMPLE', 'def_PTS', 'def_REB', 'def_AST', 'def_MIN']
+        
+        # Calculate Per-Minute Rates for the Defense
+        # def_PTS_PER_MIN = def_PTS / def_MIN
+        # Avoid div/0
+        def_stats_advanced['def_MIN'] = def_stats_advanced['def_MIN'].replace(0, 1) # Safety
+        
+        for stat in ['PTS', 'REB', 'AST']:
+            def_stats_advanced[f'def_{stat}_PER_MIN'] = def_stats_advanced[f'def_{stat}'] / def_stats_advanced['def_MIN']
             
-        print("DvP Features Added.")
+        # Rolling Avg of these Rates
+        def_stats_advanced = def_stats_advanced.sort_values('GAME_DATE')
+        for stat in ['PTS', 'REB', 'AST']:
+            col = f'def_{stat}_PER_MIN'
+            def_stats_advanced[f'ROLL_{col}'] = def_stats_advanced.groupby([agg_key, 'POSITION_SIMPLE'])[col].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+            
+        # Merge Per-Minute DvP
+        merge_cols = ['GAME_DATE', agg_key, 'POSITION_SIMPLE'] + [f'ROLL_def_{s}_PER_MIN' for s in ['PTS', 'REB', 'AST']]
+        df = df.merge(def_stats_advanced[merge_cols], on=['GAME_DATE', agg_key, 'POSITION_SIMPLE'], how='left')
+        
+        # Fill NaNs for new cols
+        for stat in ['PTS', 'REB', 'AST']:
+            col = f'ROLL_def_{stat}_PER_MIN'
+            if col in df.columns:
+                 df[col] = df[col].fillna(df[col].mean())
+
+        print("DvP Features Added (including Per-Minute).")
         return df
 
     def calculate_h2h(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -271,11 +308,468 @@ class FeatureEngineer:
         print("Missing Players Identified.")
         return df
 
+    def calculate_per_minute_stats(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculates per-minute versions of base stats.
+        STAT_PER_MIN = STAT / MAX(MIN, 1.0)
+        """
+        print("Calculating Per-Minute Stats...")
+        
+        targets = ['PTS', 'REB', 'AST', 'FG3M', 'BLK', 'STL']
+        
+        # Ensure MIN is safe for division
+        # Create a temporary safe MIN column
+        safe_min = df['MIN'].apply(lambda x: max(x, 1.0))
+        
+        for stat in targets:
+            if stat in df.columns:
+                df[f'{stat}_PER_MIN'] = df[stat] / safe_min
+                # If original stat was 0, it remains 0.
+                
+        return df
+
+    def calculate_minutes_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculates rolling minutes statistics for the Minutes Predictor.
+        """
+        print("Calculating Minutes Features...")
+        
+        if 'MIN' not in df.columns:
+            return df
+            
+        # Recent Avg (Last 10)
+        df['recent_min_avg'] = df.groupby('PLAYER_ID')['MIN'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+        
+        # Recent Std (Last 10) - captures volatility
+        df['recent_min_std'] = df.groupby('PLAYER_ID')['MIN'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).std())
+        
+        # Season Avg (Expanding)
+        # shift(1) to avoid leaking today's minutes
+        df['season_min_avg'] = df.groupby('PLAYER_ID')['MIN'].transform(lambda x: x.shift(1).expanding().mean())
+        
+        # Fill NaNs
+        # First game: Use global average or 0? 
+        # Usually we want some reasonable default.
+        # Let's fill with 20.0 (bench/rotation avg) or just 0 if unknown.
+        df['recent_min_avg'] = df['recent_min_avg'].fillna(20.0)
+        df['recent_min_std'] = df['recent_min_std'].fillna(0.0)
+        df['season_min_avg'] = df['season_min_avg'].fillna(20.0)
+        
+        return df
+
     def _derive_opponent(self, df: pd.DataFrame) -> pd.DataFrame:
         """Parses MATCHUP to get Opponent Abbreviation."""
         # MATCHUP: "LAL vs. TOR" or "LAL @ TOR"
         # Split by ' ' and take last element.
         df['OPP_TEAM_ABBREVIATION'] = df['MATCHUP'].apply(lambda x: x.split(' ')[-1])
+        return df
+
+    def _load_with_without_cache(self) -> dict:
+        """
+        Loads with/without splits and star maps from persistent cache.
+        Returns dict with 'splits', 'stars_map', and optional 'names'.
+        """
+        if os.path.exists(WITH_WITHOUT_CACHE_PATH):
+            try:
+                data = joblib.load(WITH_WITHOUT_CACHE_PATH)
+                return data # Return full object (splits, names, stars_map)
+            except Exception as e:
+                print(f"Error loading with/without cache: {e}")
+                return {}
+        return {}
+
+    def _save_with_without_cache(self, splits: dict, names: dict = None, stars_map: dict = None):
+        """Saves with/without splits and star maps to persistent cache."""
+        os.makedirs(os.path.dirname(WITH_WITHOUT_CACHE_PATH), exist_ok=True)
+        data = {
+            'last_updated': pd.Timestamp.now(),
+            'splits': splits,
+            'names': names or {},
+            'stars_map': stars_map or {}
+        }
+        joblib.dump(data, WITH_WITHOUT_CACHE_PATH)
+        print(f"Saved With/Without Splits & Star Map to {WITH_WITHOUT_CACHE_PATH}")
+
+    def _build_with_without_splits(self, df: pd.DataFrame):
+        """
+        Builds historical performance splits.
+        """
+        print("Building With/Without Splits Cache...")
+        
+        # Capture ID->Name Map
+        id_to_name = df[['PLAYER_ID', 'PLAYER_NAME']].drop_duplicates().set_index('PLAYER_ID')['PLAYER_NAME'].to_dict()
+        
+        # ... (rest is same, but pass id_to_name to save)
+
+        # We need per-season identification
+        stars_map = {} # (Team, Season) -> [PIDs]
+        
+        # Calculate Season Avg stats first if not present
+        if 'USG_PCT' not in df.columns:
+            # Should have been calculated by now if called in correct order
+            return 
+            
+        summary = df.groupby(['SEASON_YEAR', 'TEAM_ID', 'PLAYER_ID'])[['USG_PCT', 'MIN']].mean().reset_index()
+        
+        for (season, team), group in summary.groupby(['SEASON_YEAR', 'TEAM_ID']):
+            # Filter low minute players (garbage time usage outliers)
+            valid = group[group['MIN'] > 15]
+            if valid.empty: valid = group
+            
+            top_usage = valid.sort_values('USG_PCT', ascending=False).head(3)
+            stars_map[(team, season)] = top_usage['PLAYER_ID'].tolist()
+            
+        # 2. Iterate through each team's games
+        # This is computationally expensive, so we optimize.
+        
+        splits = {} # {pid: {teammate_id: {'with': stats, 'without': stats}}}
+        
+        # Group by Team to process roster combos
+        # We only care about "Active" players impact on "Active" players
+        
+        present_players = df.groupby(['TEAM_ID', 'GAME_DATE'])['PLAYER_ID'].apply(set).to_dict()
+        
+        # Iterate over all players who played? No, iterate over team games.
+        # Check all rotation players.
+        
+        metrics = ['USG_PCT', 'PTS', 'FGA', 'MIN', 'TOUCHES']
+        
+        # Loop through identifying stars and calculate their impact on everyone else
+        # This is O(Games * RosterSize * KeyTeammates)
+        
+        # Optimization: Pre-calculate per-game stats dict for fast lookup
+        # (pid, date) -> {stats}
+        # But DataFrame lookup with multi-index is okay if sorted.
+        
+        # Let's reduce scope to just "Rotation Players" affected by "Stars"
+        # We already have _build_rotation_map logic inside identify_rotation?
+        # Let's just do it dynamically.
+        
+        for (season, team), stars in stars_map.items():
+            # Get all games for this team-season
+            team_season_df = df[(df['TEAM_ID'] == team) & (df['SEASON_YEAR'] == season)]
+            if team_season_df.empty: continue
+            
+            # Get list of all players who played significant minutes
+            roster = team_season_df.groupby('PLAYER_ID')['MIN'].mean()
+            roster = roster[roster > 10].index.tolist()
+            
+            for star_id in stars:
+                # Identify games where Star was IN vs OUT
+                # Star IN: star_id in present_players[(team, date)]
+                # Star OUT: star_id NOT in present_players AND (team, date) is valid game
+                
+                # We need all dates this team played
+                team_dates = team_season_df['GAME_DATE'].unique()
+                
+                games_with = []
+                games_without = []
+                
+                for d in team_dates:
+                    roster_today = present_players.get((team, d), set())
+                    if star_id in roster_today:
+                        games_with.append(d)
+                    else:
+                        games_without.append(d)
+                
+                if not games_without: continue # Star never missed a game
+                if len(games_without) < MIN_SPLIT_SAMPLE_SIZE: continue # Sample too small
+                
+                # Now calculate impact on Teammates
+                for teammate_id in roster:
+                    if teammate_id == star_id: continue
+                    
+                    if teammate_id not in splits: splits[teammate_id] = {}
+                    
+                    # Get stats for Teammate in 'with' games
+                    p_with = team_season_df[(team_season_df['PLAYER_ID'] == teammate_id) & (team_season_df['GAME_DATE'].isin(games_with))]
+                    p_without = team_season_df[(team_season_df['PLAYER_ID'] == teammate_id) & (team_season_df['GAME_DATE'].isin(games_without))]
+                    
+                    if p_without.empty: continue
+                    
+                    # Calculate aggregates
+                    stats_with = p_with[metrics].mean().to_dict()
+                    stats_without = p_without[metrics].mean().to_dict()
+                    
+                    # Store
+                    splits[teammate_id][star_id] = {
+                        'with': stats_with,
+                        'without': stats_without,
+                        'sample_without': len(p_without)
+                    }
+                    
+                    
+        self._save_with_without_cache(splits, names=id_to_name, stars_map=stars_map)
+
+    def calculate_usage_rate(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculates Usage Rate (USG%) for each player-game.
+        Formula: 100 * ((FGA + 0.44 * FTA + TOV) * (Team_MIN / 5)) / (MIN * (Team_FGA + 0.44 * Team_FTA + Team_TOV))
+        """
+        print("Calculating Usage Rates...")
+        
+        # 1. Aggregate Team Stats per Game needed for formula
+        # We need Team FGA, Team FTA, Team TOV, Team MIN
+        team_stats = df.groupby(['GAME_ID', 'TEAM_ID'])[['FGA', 'FTA', 'TOV', 'MIN']].sum().reset_index()
+        team_stats = team_stats.rename(columns={
+            'FGA': 'TEAM_FGA', 
+            'FTA': 'TEAM_FTA', 
+            'TOV': 'TEAM_TOV', 
+            'MIN': 'TEAM_MIN'
+        })
+        
+        # 2. Merge back to player rows
+        df = df.merge(team_stats, on=['GAME_ID', 'TEAM_ID'], how='left')
+        
+        # 3. Calculate USG%
+        # Handle zero MIN to avoid div/0
+        
+        # (FGA + 0.44 * FTA + TOV)
+        player_poss = df['FGA'] + 0.44 * df['FTA'] + df['TOV']
+        
+        # (Team_FGA + 0.44 * Team_FTA + Team_TOV)
+        team_poss = df['TEAM_FGA'] + 0.44 * df['TEAM_FTA'] + df['TEAM_TOV']
+        
+        term1 = player_poss * (df['TEAM_MIN'] / 5)
+        term2 = df['MIN'] * team_poss
+        
+        df['USG_PCT'] = 100 * (term1 / term2)
+        
+        df['USG_PCT'] = 100 * (term1 / term2)
+        
+        # Fill NaNs/Infs (e.g. 0 minutes played)
+        df['USG_PCT'] = df['USG_PCT'].replace([np.inf, -np.inf], 0).fillna(0)
+        
+        # Calculate Proxy TOUCHES: 
+        # FGA + (FTA * 0.44) + TOV + AST
+        # (Passes are touches, but we only have AST. This is a rough proxy for "Ball Dominance")
+        if 'AST' in df.columns:
+            df['TOUCHES'] = df['FGA'] + (df['FTA'] * 0.44) + df['TOV'] + df['AST']
+        else:
+            df['TOUCHES'] = df['FGA'] + (df['FTA'] * 0.44) + df['TOV']
+            
+        df['TOUCHES'] = df['TOUCHES'].fillna(0)
+
+        # Added per-minute version for opportunity analysis
+        safe_min = df['MIN'].apply(lambda x: max(x, 1.0))
+        df['TOUCHES_PER_MIN'] = df['TOUCHES'] / safe_min
+        
+        # 4. Rolling USG%
+        # df is already sorted by date in process() usually, but safe to verify
+        df['ROLL_USG_PCT'] = df.groupby('PLAYER_ID')['USG_PCT'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+        df['ROLL_USG_PCT'] = df['ROLL_USG_PCT'].fillna(df['USG_PCT'].mean())
+        
+        print("Usage Rate Features Added.")
+        return df
+
+    def _apply_injury_severity_weights(self, df: pd.DataFrame, injury_report: dict) -> pd.DataFrame:
+        """
+        Adjusts opportunity boosts based on injury severity from the report.
+        {'Out': 1.0, 'Doubtful': 0.7, 'Questionable': 0.3}
+        """
+        if not injury_report:
+            return df
+            
+        print("Applying Injury Severity Weights...")
+        
+        # 1. Map Player IDs to Names (reverse lookup needed or fuzzy match)
+        # MISSING_PLAYER_IDS contains IDs like "123_456".
+        # Injury Report has Names "LeBron James": "Out".
+        
+        # We need to lookup the Status of each Missing ID.
+        # This requires ID -> Name mapping.
+        # We can build a quick map from the DF itself (PLAYER_ID -> PLAYER_NAME)
+        # But MISSING_PLAYER_IDS are Teammates, not necessarily in the current row's Player Name.
+        # However, they should exist in the dataframe somewhere if they are relevant.
+        
+        id_to_name = df[['PLAYER_ID', 'PLAYER_NAME']].drop_duplicates().set_index('PLAYER_ID')['PLAYER_NAME'].to_dict()
+        
+        def calculate_severity_total(missing_str):
+            if not missing_str or missing_str == "NONE": return 0.0
+            
+            ids = missing_str.split('_')
+            total_weight = 0.0
+            
+            for pid_str in ids:
+                try:
+                    pid = int(pid_str)
+                    pname = id_to_name.get(pid)
+                    if not pname: continue
+                    
+                    # Fuzzy match against injury report
+                    # We can use the cached fuzzy match helper if available or direct lookup
+                    # optimization: try direct first
+                    status = injury_report.get(pname)
+                    if not status:
+                        # Try fuzzy
+                        match_name = _fuzzy_match_player_name(pname, injury_report.keys())
+                        status = injury_report.get(match_name, "Active")
+                        
+                    weight = INJURY_SEVERITY_WEIGHTS.get(status, 0.0)
+                    total_weight += weight
+                except:
+                    continue
+                    
+            return total_weight
+
+        # Calculate Total Severity Score for the row (Missing Players context)
+        # This represents "How Verified/Severe is the absence?"
+        # If ID is in MISSING_PLAYER_IDS (calculated from boxscores), it means they ARE missing in historical data.
+        # But for *Prediction* (overrides), we rely on Injury Report.
+        # For Training, we assume Severity = 1.0 (Confirmed Out).
+        # So this method assumes we are in Prediction mode or treating historicals as fully confirmed.
+        # Actually, for training, strict "Out" is via boxscore check.
+        
+        # Applying weight to the BOOST features.
+        # If we are training, we trust the boxscore: Weight = 1.0.
+        # If we are predicting, we trust the report: Weight = Status.
+        
+        df['INJURY_SEVERITY_TOTAL'] = df['MISSING_PLAYER_IDS'].apply(calculate_severity_total)
+        
+        # Scale the boosts
+        # If Severity is 0 (Active), Boost becomes 0.
+        # If Severity is 0.3 (Questionable), Boost is dampened.
+        
+        # Note: If multiple players missing, we need per-player weight * per-player boost.
+        # The current aggregation in calculate_star_usage_shift sums them up.
+        # Ideally we apply weight during summation.
+        # But here we do a post-hoc adjustment?
+        # Approximation: Weighted Score = Raw Score * (Avg Severity)?
+        # Or Severity Total?
+        # Let's simple-scale for now: Weighted = Raw * (Total Severity / Count Missing) ?
+        # No, let's keep it simple: Weighted Opportunity = Raw Opportunity * (Severity of the Missing Star).
+        # Since Raw Opportunity is a sum, we can't easily disentangle without re-looping.
+        # Let's adjust calculate_star_usage_shift to accept injury_report and do it there!
+        
+        return df
+
+    def calculate_star_usage_shift(self, df: pd.DataFrame, injury_report: dict = None) -> pd.DataFrame:
+        """
+        Quantifies opportunity redistribution when stars are missing.
+        Calculates delta in USG, PTS, FGA based on historical 'without' splits.
+        """
+        print("Calculating Star Usage Shift (Opportunity)...")
+        cache_data = self._load_with_without_cache()
+        
+        # cache_data is now dict: {'splits': ..., 'names': ..., 'stars_map': ...} or empty
+        splits = cache_data.get('splits', {})
+        cached_names = cache_data.get('names', {})
+        stars_map = cache_data.get('stars_map', {})
+        
+        if not splits:
+            print("No with/without splits found. Skipping opportunity features.")
+            columns_to_clear = ['OPP_SCORE', 'OPP_USG_BOOST', 'OPP_MIN_BOOST', 'OPP_FGA_BOOST', 'OPP_TOUCHES_BOOST', 'INJURY_SEVERITY_TOTAL', 
+                                'OPP_SCORE_WEIGHTED', 'OPP_USG_WEIGHTED', 'STARS_OUT']
+            for c in columns_to_clear:
+                df[c] = 0.0
+            return df
+            
+        # Helper map for ID -> Name
+        # 1. From DF (present players) - reliable for Present
+        id_to_name = df[['PLAYER_ID', 'PLAYER_NAME']].drop_duplicates().set_index('PLAYER_ID')['PLAYER_NAME'].to_dict()
+        
+        # 2. Merge with Cache (Legacy/Missing players)
+        # Cache wins if DF is missing it? Or DF wins? DF is strictly current. Cache is broad.
+        # Use cache as base, update with DF.
+        full_id_to_name = cached_names.copy()
+        full_id_to_name.update(id_to_name)
+        id_to_name = full_id_to_name
+        
+        
+        def calculate_boost(row):
+            me = int(row['PLAYER_ID'])
+            team = int(row['TEAM_ID'])
+            season = int(row['SEASON_YEAR'])
+            missing_str = row['MISSING_PLAYER_IDS']
+            
+            if not missing_str or missing_str == "NONE":
+                return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                
+            missing_ids = [int(i) for i in missing_str.split('_')]
+            
+            usg_delta_sum = 0.0
+            min_delta_sum = 0.0
+            fga_delta_sum = 0.0
+            touches_delta_sum = 0.0
+            severity_total = 0.0
+            stars_out_count = 0.0
+            
+            my_splits = splits.get(me, {})
+            team_stars = stars_map.get((team, season), [])
+            
+            for missing_id in missing_ids:
+                try:
+                    # 1. Determine Weight (Matches previous logic)
+                    weight = 1.0
+                    if injury_report:
+                        pname = id_to_name.get(missing_id)
+                        if pname:
+                            status = injury_report.get(pname)
+                            if not status:
+                                 match_name = _fuzzy_match_player_name(pname, injury_report.keys())
+                                 status = injury_report.get(match_name, "Active")
+                            if status:
+                                weight = INJURY_SEVERITY_WEIGHTS.get(status, 1.0)
+                    
+                    severity_total += weight
+                    
+                    # Check if this missing player is a star
+                    if missing_id in team_stars:
+                        stars_out_count += weight if injury_report else 1.0
+                    
+                    # 2. Get Deltas
+                    if missing_id in my_splits:
+                        s = my_splits[missing_id]
+                        
+                        # With vs Without
+                        # Delta = Without - With
+                        w_usg = s['with'].get('USG_PCT', 0)
+                        wo_usg = s['without'].get('USG_PCT', 0)
+                        
+                        w_min = s['with'].get('MIN', 0)
+                        wo_min = s['without'].get('MIN', 0)
+                        
+                        w_fga = s['with'].get('FGA', 0)
+                        wo_fga = s['without'].get('FGA', 0)
+                        
+                        w_tch = s['with'].get('TOUCHES', 0)
+                        wo_tch = s['without'].get('TOUCHES', 0)
+                        
+                        usg_delta_sum += (wo_usg - w_usg) * weight
+                        min_delta_sum += (wo_min - w_min) * weight
+                        fga_delta_sum += (wo_fga - w_fga) * weight
+                        touches_delta_sum += (wo_tch - w_tch) * weight
+                        
+                except Exception as e:
+                    continue
+            
+            # Weighted Score
+            # (USG_BOOST * 0.4) + (MIN_BOOST * 0.2) + (FGA_BOOST * 0.2) + (TOUCHES_BOOST * 0.2)
+            opp_score = (usg_delta_sum * 0.4) + (min_delta_sum * 0.2) + (fga_delta_sum * 0.2) + (touches_delta_sum * 0.2)
+            
+            # Cap realistic boosts
+            usg_delta_sum = min(max(usg_delta_sum, -5.0), MAX_OPPORTUNITY_BOOST)
+            
+            return opp_score, usg_delta_sum, min_delta_sum, fga_delta_sum, touches_delta_sum, severity_total, stars_out_count
+
+        # Apply
+        results = df.apply(calculate_boost, axis=1)
+        
+        # Unpack
+        df['OPP_SCORE'] = [x[0] for x in results]
+        df['OPP_USG_BOOST'] = [x[1] for x in results]
+        df['OPP_MIN_BOOST'] = [x[2] for x in results]
+        df['OPP_FGA_BOOST'] = [x[3] for x in results]
+        df['OPP_TOUCHES_BOOST'] = [x[4] for x in results]
+        df['INJURY_SEVERITY_TOTAL'] = [x[5] for x in results]
+        df['STARS_OUT'] = [x[6] for x in results]
+        
+        # Weighted features (Directly redundant if weight applied above? 
+        
+        df['OPP_SCORE_WEIGHTED'] = df['OPP_SCORE'] # Already weighted
+        df['OPP_USG_WEIGHTED'] = df['OPP_USG_BOOST']
+        
+        print("Star Usage Shift Features Added.")
         return df
 
     def calculate_team_stats(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -355,6 +849,7 @@ class FeatureEngineer:
     def process(self, df: pd.DataFrame, is_training: bool = True, overrides: dict = None) -> pd.DataFrame:
         """
         overrides: Dict of {(PlayerID, Date_Str) : {'Col': Val}} to manually set feature values before scaling.
+        Also supports 'INJURY_REPORT' in overrides for prediction context.
         """
         print("Starting Feature Engineering...")
         if is_training:
@@ -367,6 +862,9 @@ class FeatureEngineer:
         # Derive Opponent Info EARLY
         df = self._derive_opponent(df)
         
+        # Add Context Features (Home/Away, Rest Days)
+        df = self._add_context_features(df)
+        
         # Load Positions & Add DvP
         pos_df = self.load_player_positions()
         if not pos_df.empty:
@@ -377,44 +875,75 @@ class FeatureEngineer:
         # Add H2H
         df = self.calculate_h2h(df)
         
+        # Add Usage Rate (NEW)
+        df = self.calculate_usage_rate(df)
+        
         # Add Team Stats (Defense/Pace)
         df = self.calculate_team_stats(df)
         
         # Add Teammate Impact
         df = self.calculate_missing_players(df)
-
-        # APPLY OVERRIDES (Pre-Scaling)
+        
+        # APPLY OVERRIDES (Pre-Scaling) -- Moved here per verification comment
+        # Must apply overrides BEFORE per-minute/minutes calc so they use the override values.
+        injury_report_override = None
+        
         if overrides:
-            print(f"Applying manual overrides: {overrides}")
-            # Ensure Date column is string or matching format
-            # df['GAME_DATE'] is datetime by now (Line 196 converts it, wait)
-            # Line 196: df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
-            # So keys in overrides should use Timestamp or we convert.
-            
+            print(f"Applying manual overrides...")
             for (pid, date_str), vals in overrides.items():
                 target_dt = pd.to_datetime(date_str)
                 mask = (df['PLAYER_ID'] == pid) & (df['GAME_DATE'] == target_dt)
                 if mask.any():
                     for col, val in vals.items():
-                        # If overriding MISSING_PLAYER_IDS, ensure string format?
-                        # Caller (daily_predict) will pass list of ints?
+                        # Extract INJURY_REPORT if present
+                        if col == 'INJURY_REPORT':
+                            injury_report_override = val
+                            continue
+                            
+                        # If overriding MISSING_PLAYER_IDS, ensure string format
                         if col == 'MISSING_PLAYER_IDS' and isinstance(val, list):
                             val = "_".join(map(str, val))
                         
                         df.loc[mask, col] = val
-                        print(f"Overrode {col}={val} for {pid} on {date_str}")
+                        # print(f"Overrode {col} for {pid} on {date_str}")
+        
+        # Add Per-Minute Stats (NEW)
+        df = self.calculate_per_minute_stats(df)
+        
+        # Add Minutes Features (NEW)
+        df = self.calculate_minutes_features(df)
 
+
+        
+        # Build Splits Cache (Training Only) (NEW) - ORDER FIXED: Build BEFORE Shift Calc
+        if is_training:
+            self._build_with_without_splits(df)
+            
+        # Add Star Usage Shift Features (NEW)
+        # Pass injury report if available from overrides (Prediction Mode)
+        # Now cache should be populated for the current run if is_training was True
+        df = self.calculate_star_usage_shift(df, injury_report=injury_report_override)
+        
         # Sort
         # df['GAME_DATE'] is already datetime
         df = df.sort_values(['PLAYER_ID', 'GAME_DATE'])
         
         # 1. Rolling Averages (Player Form)
         # Shift by 1 so we don't cheat using today's stats
+        # Add Per-Minute Stats to rolling window
         cols = ['PTS', 'REB', 'AST', 'FGM', 'FGA', 'FG_PCT', 'FG3M', 'FG3A', 'FG3_PCT', 
-                'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'STL', 'BLK', 'TOV', 'PF', 'PLUS_MINUS', 'MIN']
+                'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'STL', 'BLK', 'TOV', 'PF', 'PLUS_MINUS', 'MIN',
+                'USG_PCT',
+                'PTS_PER_MIN', 'REB_PER_MIN', 'AST_PER_MIN', 'FG3M_PER_MIN', 'BLK_PER_MIN', 'STL_PER_MIN'] # Added Per-Minute
         for col in cols:
              if col in df.columns:
+                 # Standard Last 5
                  df[f'ROLL_{col}'] = df.groupby('PLAYER_ID')[col].transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+                 
+                 # Extended Windows for Per-Minute Stats (Comment 2)
+                 if '_PER_MIN' in col:
+                     # Add Last 10
+                     df[f'ROLL_{col}_10'] = df.groupby('PLAYER_ID')[col].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
              
         # 2. Rest Days
         df['GAME_DATE_DT'] = df['GAME_DATE']
@@ -422,6 +951,12 @@ class FeatureEngineer:
         df['DAYS_REST'] = (df['GAME_DATE_DT'] - df['PREV_GAME_DATE']).dt.days
         df['DAYS_REST'] = df['DAYS_REST'].fillna(7)
         df['DAYS_REST'] = df['DAYS_REST'].clip(upper=7)
+        
+        # Capture RAW features for Minutes Predictor before scaling
+        min_pred_features = ['recent_min_avg', 'recent_min_std', 'season_min_avg', 'INJURY_SEVERITY_TOTAL', 'STARS_OUT', 'OPP_ROLL_PACE', 'IS_HOME', 'DAYS_REST']
+        for f in min_pred_features:
+            if f in df.columns:
+                df[f'{f}_RAW'] = df[f]
         
         # 3. Apply Scaling / Encoding
         if is_training:
@@ -452,7 +987,11 @@ class FeatureEngineer:
         
         # Parse Season Year (for weighting)
         # SEASON_ID is usually like 22023 -> 2023.
-        df['SEASON_YEAR'] = df['SEASON_ID'].astype(str).str[-4:].astype(int)
+        # Robust handling for float strings (e.g. '22024.0')
+        s_ids = df['SEASON_ID'].fillna(22025).astype(str)
+        s_ids = s_ids.str.replace(r'\.0$', '', regex=True)
+        # Consistent with load_all_data: 22025 -> 2026 (2025-26 Season)
+        df['SEASON_YEAR'] = s_ids.str[-4:].astype(int) + 1
         
         return df
 
@@ -510,7 +1049,11 @@ class FeatureEngineer:
                    
         # Also exclude Targets
         exclude += ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'PF', 'FGM', 'FGA', 'FG_PCT', 
-                    'FG3M', 'FG3A', 'FG3_PCT', 'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'PLUS_MINUS', 'FANTASY_PTS']
+                    'FG3M', 'FG3A', 'FG3_PCT', 'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'PLUS_MINUS', 'FANTASY_PTS',
+                    'USG_PCT'] # Exclude raw USG_PCT as it is a target-derived stat unavailable at inference time
+        
+        # Also exclude raw Per-Minute stats (Targets)
+        exclude += ['PTS_PER_MIN', 'REB_PER_MIN', 'AST_PER_MIN', 'FG3M_PER_MIN', 'BLK_PER_MIN', 'STL_PER_MIN']
         
         feature_cols = [c for c in df.columns if c not in exclude and np.issubdtype(df[c].dtype, np.number)]
         print(f"Identified {len(feature_cols)} feature columns: {feature_cols}")
@@ -540,6 +1083,12 @@ class FeatureEngineer:
         feature_cols = joblib.load(os.path.join(MODELS_DIR, 'feature_cols.joblib'))
         
         # Scale continuous
+        # Ensure all columns exist (fill with 0 if missing - e.g. new features in old model?)
+        # But we are retraining so feature_cols should match.
+        for c in feature_cols:
+            if c not in df.columns:
+                 df[c] = 0.0
+                 
         df[feature_cols] = self.scaler.transform(df[feature_cols].fillna(0))
         
         # 2. Embeddings Indices
@@ -571,14 +1120,15 @@ class FeatureEngineer:
         # feature_cols joblib already has the names? 
         # Yes, _fit_artifacts logic below needs to include them in the 'continuous_cols' list.
         # But here we explicitly list non-feature metadata key columns.
-        cols = ['PLAYER_ID', 'PLAYER_IDX', 'TEAM_IDX', 'SEASON_YEAR', 'GAME_DATE', 'PTS', 'REB', 'AST', 'FG3M', 'BLK', 'STL', 'MISSING_PLAYER_IDS']
+        cols = ['PLAYER_ID', 'PLAYER_IDX', 'TEAM_IDX', 'SEASON_YEAR', 'GAME_DATE', 'PTS', 'REB', 'AST', 'FG3M', 'BLK', 'STL', 'MIN', 'MISSING_PLAYER_IDS', 'USG_PCT', 'PTS_PER_MIN', 'REB_PER_MIN', 'AST_PER_MIN', 'FG3M_PER_MIN', 'BLK_PER_MIN', 'STL_PER_MIN']
         feature_cols = joblib.load(os.path.join(MODELS_DIR, 'feature_cols.joblib'))
         
         # Ensure all columns exist
-        final_cols = cols + feature_cols
+        final_cols = list(set(cols + feature_cols)) # Dedup just in case
         final_df = df[final_cols]
         final_df.to_csv(os.path.join(PROCESSED_DIR, filename), index=False)
         print(f"Saved processed features to {filename}")
+
 
 if __name__ == "__main__":
     fe = FeatureEngineer()
